@@ -333,6 +333,8 @@ ARROW_ACERO_SRCS = """
     cpp/src/arrow/acero/tpch_node.cc
     cpp/src/arrow/acero/union_node.cc
     cpp/src/arrow/acero/util.cc
+    cpp/src/arrow/acero/time_series_util.cc
+    cpp/src/arrow/acero/sorted_merge_node.cc
     cpp/src/arrow/acero/bloom_filter_avx2.cc
     cpp/src/arrow/acero/swiss_join_avx2.cc
 """
