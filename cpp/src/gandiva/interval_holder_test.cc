@@ -20,8 +20,8 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <vector>
 
+#include "arrow/testing/gtest_util.h"
 #include "gandiva/execution_context.h"
 
 namespace gandiva {
@@ -32,14 +32,8 @@ class TestIntervalHolder : public ::testing::Test {
 };
 
 TEST_F(TestIntervalHolder, TestMatchAllPeriods) {
-  std::shared_ptr<IntervalDaysHolder> interval_days_holder;
-  std::shared_ptr<IntervalYearsHolder> interval_years_holder;
-
-  auto status = IntervalDaysHolder::Make(0, &interval_days_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
-
-  status = IntervalYearsHolder::Make(0, &interval_years_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
+  EXPECT_OK_AND_ASSIGN(auto interval_days_holder, IntervalDaysHolder::Make(0));
+  EXPECT_OK_AND_ASSIGN(auto interval_years_holder, IntervalYearsHolder::Make(0));
 
   auto& cast_interval_day = *interval_days_holder;
   auto& cast_interval_year = *interval_years_holder;
@@ -60,6 +54,22 @@ TEST_F(TestIntervalHolder, TestMatchAllPeriods) {
   EXPECT_EQ(response_interval_yrs, 73834992);
   EXPECT_TRUE(out_valid);
   EXPECT_FALSE(execution_context_.has_error());
+
+  data = "1";
+  response = cast_interval_day(&execution_context_, data.data(), 1, true, &out_valid);
+  qty_days_in_response = 0;
+  qty_millis_in_response = 1;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response, (qty_millis_in_response << 32) | qty_days_in_response);
+
+  data = "PT0.001S";
+  response = cast_interval_day(&execution_context_, data.data(), 8, true, &out_valid);
+  qty_days_in_response = 0;
+  qty_millis_in_response = 1;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response, (qty_millis_in_response << 32) | qty_days_in_response);
 
   // Pass only years and days to cast
   data = "P12Y15D";
@@ -197,17 +207,84 @@ TEST_F(TestIntervalHolder, TestMatchAllPeriods) {
   EXPECT_TRUE(out_valid);
   EXPECT_FALSE(execution_context_.has_error());
   EXPECT_EQ(response_interval_yrs, 35);
+
+  // Pass negative value
+  data = "P-1D";
+  response = cast_interval_day(&execution_context_, data.data(), 4, true, &out_valid);
+  qty_days_in_response = -1;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  data = "P-2D";
+  response = cast_interval_day(&execution_context_, data.data(), 4, true, &out_valid);
+  qty_days_in_response = -2;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  data = "P-1W";
+  response = cast_interval_day(&execution_context_, data.data(), 4, true, &out_valid);
+  qty_days_in_response = -7;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  data = "P-1M";
+  response = cast_interval_day(&execution_context_, data.data(), 4, true, &out_valid);
+  qty_days_in_response = 0;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  response_interval_yrs =
+      cast_interval_year(&execution_context_, data.data(), 4, true, &out_valid);
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response_interval_yrs, -1);
+
+  data = "P-1Y";
+  response = cast_interval_day(&execution_context_, data.data(), 4, true, &out_valid);
+  qty_days_in_response = 0;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  response_interval_yrs =
+      cast_interval_year(&execution_context_, data.data(), 4, true, &out_valid);
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response_interval_yrs, -12);
+
+  data = "P-1Y-2M";
+  response = cast_interval_day(&execution_context_, data.data(), 7, true, &out_valid);
+  qty_days_in_response = 0;
+  qty_millis_in_response = 0;
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response,
+            (qty_millis_in_response << 32) | (qty_days_in_response & 0x00000000FFFFFFFF));
+
+  response_interval_yrs =
+      cast_interval_year(&execution_context_, data.data(), 7, true, &out_valid);
+  EXPECT_TRUE(out_valid);
+  EXPECT_FALSE(execution_context_.has_error());
+  EXPECT_EQ(response_interval_yrs, -14);
 }
 
 TEST_F(TestIntervalHolder, TestMatchErrorsForCastIntervalDay) {
-  std::shared_ptr<IntervalDaysHolder> interval_days_holder;
-  std::shared_ptr<IntervalYearsHolder> interval_years_holder;
-
-  auto status = IntervalDaysHolder::Make(0, &interval_days_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
-
-  status = IntervalYearsHolder::Make(0, &interval_years_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
+  EXPECT_OK_AND_ASSIGN(auto interval_days_holder, IntervalDaysHolder::Make(0));
+  EXPECT_OK_AND_ASSIGN(auto interval_years_holder, IntervalYearsHolder::Make(0));
 
   auto& cast_interval_day = *interval_days_holder;
   auto& cast_interval_year = *interval_years_holder;
@@ -351,12 +428,8 @@ TEST_F(TestIntervalHolder, TestMatchErrorsForCastIntervalDay) {
 }
 
 TEST_F(TestIntervalHolder, TestUsingWeekFormatterForCastIntervalDay) {
-  std::shared_ptr<IntervalDaysHolder> interval_holder;
-
-  auto status = IntervalDaysHolder::Make(0, &interval_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
-
-  auto& cast_interval_day = *interval_holder;
+  EXPECT_OK_AND_ASSIGN(auto interval_days_holder, IntervalDaysHolder::Make(0));
+  auto& cast_interval_day = *interval_days_holder;
 
   bool out_valid;
   std::string data("P1W");
@@ -376,12 +449,8 @@ TEST_F(TestIntervalHolder, TestUsingWeekFormatterForCastIntervalDay) {
 }
 
 TEST_F(TestIntervalHolder, TestUsingCompleteFormatterForCastIntervalDay) {
-  std::shared_ptr<IntervalDaysHolder> interval_holder;
-
-  auto status = IntervalDaysHolder::Make(0, &interval_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
-
-  auto& cast_interval_day = *interval_holder;
+  EXPECT_OK_AND_ASSIGN(auto interval_days_holder, IntervalDaysHolder::Make(0));
+  auto& cast_interval_day = *interval_days_holder;
 
   bool out_valid;
   std::string data("1742461111");
@@ -439,11 +508,7 @@ TEST_F(TestIntervalHolder, TestUsingCompleteFormatterForCastIntervalDay) {
 }
 
 TEST_F(TestIntervalHolder, TestUsingCompleteFormatterForCastIntervalYear) {
-  std::shared_ptr<IntervalYearsHolder> interval_years_holder;
-
-  auto status = IntervalYearsHolder::Make(0, &interval_years_holder);
-  EXPECT_EQ(status.ok(), true) << status.message();
-
+  EXPECT_OK_AND_ASSIGN(auto interval_years_holder, IntervalYearsHolder::Make(0));
   auto& cast_interval_years = *interval_years_holder;
 
   bool out_valid;

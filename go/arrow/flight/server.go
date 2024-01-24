@@ -17,12 +17,12 @@
 package flight
 
 import (
-	context "context"
+	"context"
 	"net"
 	"os"
 	"os/signal"
 
-	"github.com/apache/arrow/go/v8/arrow/flight/internal/flight"
+	"github.com/apache/arrow/go/v15/arrow/flight/gen/flight"
 	"google.golang.org/grpc"
 )
 
@@ -42,22 +42,83 @@ type (
 	FlightEndpoint                  = flight.FlightEndpoint
 	Location                        = flight.Location
 	FlightInfo                      = flight.FlightInfo
+	PollInfo                        = flight.PollInfo
 	FlightData                      = flight.FlightData
 	PutResult                       = flight.PutResult
 	Ticket                          = flight.Ticket
 	SchemaResult                    = flight.SchemaResult
 	Action                          = flight.Action
 	ActionType                      = flight.ActionType
+	CancelFlightInfoRequest         = flight.CancelFlightInfoRequest
+	RenewFlightEndpointRequest      = flight.RenewFlightEndpointRequest
 	Result                          = flight.Result
+	CancelFlightInfoResult          = flight.CancelFlightInfoResult
+	CancelStatus                    = flight.CancelStatus
 	Empty                           = flight.Empty
 )
+
+// Constants for Action types
+const (
+	CancelFlightInfoActionType    = "CancelFlightInfo"
+	RenewFlightEndpointActionType = "RenewFlightEndpoint"
+)
+
+// Constants for CancelStatus
+const (
+	// The cancellation status is unknown. Servers should avoid
+	// using this value (send a NOT_FOUND error if the requested
+	// FlightInfo is not known). Clients can retry the request.
+	CancelStatusUnspecified = flight.CancelStatus_CANCEL_STATUS_UNSPECIFIED
+	// The cancellation request is complete. Subsequent requests
+	// with the same payload may return CancelStatusCancelled or a
+	// arrow.ErrNotFound error.
+	CancelStatusCancelled = flight.CancelStatus_CANCEL_STATUS_CANCELLED
+	// The cancellation request is in progress. The client may
+	// retry the cancellation request.
+	CancelStatusCancelling = flight.CancelStatus_CANCEL_STATUS_CANCELLING
+	// The FlightInfo is not cancellable. The client should not
+	// retry the cancellation request.
+	CancelStatusNotCancellable = flight.CancelStatus_CANCEL_STATUS_NOT_CANCELLABLE
+)
+
+// RegisterFlightServiceServer registers an existing flight server onto an
+// existing grpc server, or anything that is a grpc service registrar.
+func RegisterFlightServiceServer(s *grpc.Server, srv FlightServer) {
+	flight.RegisterFlightServiceServer(s, srv)
+}
+
+// From https://github.com/grpc/grpc-go/blob/4c776ec01572d55249df309251900554b46adb41/reflection/serverreflection.go#L69-L83
+// This interface is inlined to make this arrow library compatible with
+// grpc < 1.45 .
+// See "google.golang.org/grpc/reflection" 's reflection.ServiceInfoProvider .
+// serviceInfoProvider is an interface used to retrieve metadata about the
+// services to expose.
+//
+// The reflection service is only interested in the service names, but the
+// signature is this way so that *grpc.Server implements it. So it is okay
+// for a custom implementation to return zero values for the
+// grpc.ServiceInfo values in the map.
+//
+// # Experimental
+//
+// Notice: This type is EXPERIMENTAL and may be changed or removed in a
+// later release.
+type serviceInfoProvider interface {
+	GetServiceInfo() map[string]grpc.ServiceInfo
+}
 
 // Server is an interface for hiding some of the grpc specifics to make
 // it slightly easier to manage a flight service, slightly modeled after
 // the C++ implementation
 type Server interface {
-	// Init takes in the address to bind to and creates the listener
+	// Init takes in the address to bind to and creates the listener. If both this
+	// and InitListener are called, then whichever was called last will be used.
 	Init(addr string) error
+	// InitListener initializes with an already created listener rather than
+	// creating a new one like Init does. If both this and Init are called,
+	// whichever was called last is what will be used as they both set a listener
+	// into the server.
+	InitListener(lis net.Listener)
 	// Addr will return the address that was bound to for the service to listen on
 	Addr() net.Addr
 	// SetShutdownOnSignals sets notifications on the given signals to call GracefulStop
@@ -73,6 +134,12 @@ type Server interface {
 	// RegisterFlightService sets up the handler for the Flight Endpoints as per
 	// normal Grpc setups
 	RegisterFlightService(FlightServer)
+	// ServiceRegistrar wraps a single method that supports service registration.
+	// For example, it may be used to register health check provided by grpc-go.
+	grpc.ServiceRegistrar
+	// serviceInfoProvider is an interface used to retrieve metadata about the services to expose.
+	// If reflection is enabled on the server, all the endpoints can be invoked using grpcurl.
+	serviceInfoProvider
 }
 
 // BaseFlightServer is the base flight server implementation and must be
@@ -98,7 +165,7 @@ func (s *BaseFlightServer) Handshake(stream flight.FlightService_HandshakeServer
 }
 
 // CustomerServerMiddleware is a helper interface for more easily defining custom
-// grpc middlware without having to expose or understand all the grpc bells and whistles.
+// grpc middleware without having to expose or understand all the grpc bells and whistles.
 type CustomServerMiddleware interface {
 	// StartCall will be called with the current context of the call, grpc.SetHeader can be used to add outgoing headers
 	// if the returned context is non-nil, then it will be used as the new context being passed through the calls
@@ -157,7 +224,7 @@ type server struct {
 // the utility of the helpers
 //
 // Deprecated: prefer to use NewServerWithMiddleware, due to auth handler middleware
-// this function will be problematic if any of the grpc options specify other middlewares.
+// this function will be problematic if any of the grpc options specify other middleware.
 func NewFlightServer(opt ...grpc.ServerOption) Server {
 	opt = append([]grpc.ServerOption{
 		grpc.ChainStreamInterceptor(serverAuthStreamInterceptor),
@@ -209,6 +276,10 @@ func (s *server) Init(addr string) (err error) {
 	return
 }
 
+func (s *server) InitListener(lis net.Listener) {
+	s.lis = lis
+}
+
 func (s *server) Addr() net.Addr {
 	return s.lis.Addr()
 }
@@ -239,4 +310,12 @@ func (s *server) RegisterFlightService(svc FlightServer) {
 
 func (s *server) Shutdown() {
 	s.server.GracefulStop()
+}
+
+func (s *server) RegisterService(sd *grpc.ServiceDesc, ss interface{}) {
+	s.server.RegisterService(sd, ss)
+}
+
+func (s *server) GetServiceInfo() map[string]grpc.ServiceInfo {
+	return s.server.GetServiceInfo()
 }

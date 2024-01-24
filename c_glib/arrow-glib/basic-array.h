@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <arrow-glib/basic-array-definition.h>
 #include <arrow-glib/basic-data-type.h>
 #include <arrow-glib/buffer.h>
 #include <arrow-glib/interval.h>
@@ -43,17 +44,6 @@ GARROW_AVAILABLE_IN_5_0
 gboolean
 garrow_equal_options_is_approx(GArrowEqualOptions *options);
 
-
-#define GARROW_TYPE_ARRAY (garrow_array_get_type())
-G_DECLARE_DERIVABLE_TYPE(GArrowArray,
-                         garrow_array,
-                         GARROW,
-                         ARRAY,
-                         GObject)
-struct _GArrowArrayClass
-{
-  GObjectClass parent_class;
-};
 
 GARROW_AVAILABLE_IN_6_0
 GArrowArray *
@@ -353,6 +343,35 @@ guint64 garrow_uint64_array_get_value(GArrowUInt64Array *array,
                                       gint64 i);
 const guint64 *garrow_uint64_array_get_values(GArrowUInt64Array *array,
                                               gint64 *length);
+
+
+#define GARROW_TYPE_HALF_FLOAT_ARRAY (garrow_half_float_array_get_type())
+G_DECLARE_DERIVABLE_TYPE(GArrowHalfFloatArray,
+                         garrow_half_float_array,
+                         GARROW,
+                         HALF_FLOAT_ARRAY,
+                         GArrowNumericArray)
+struct _GArrowHalfFloatArrayClass
+{
+  GArrowNumericArrayClass parent_class;
+};
+
+
+GARROW_AVAILABLE_IN_11_0
+GArrowHalfFloatArray *
+garrow_half_float_array_new(gint64 length,
+                            GArrowBuffer *data,
+                            GArrowBuffer *null_bitmap,
+                            gint64 n_nulls);
+
+GARROW_AVAILABLE_IN_11_0
+guint16
+garrow_half_float_array_get_value(GArrowHalfFloatArray *array,
+                                  gint64 i);
+GARROW_AVAILABLE_IN_11_0
+const guint16*
+garrow_half_float_array_get_values(GArrowHalfFloatArray *array,
+                                   gint64 *length);
 
 
 #define GARROW_TYPE_FLOAT_ARRAY (garrow_float_array_get_type())
@@ -764,16 +783,6 @@ gchar *garrow_decimal256_array_format_value(GArrowDecimal256Array *array,
 GArrowDecimal256 *garrow_decimal256_array_get_value(GArrowDecimal256Array *array,
                                                     gint64 i);
 
-#define GARROW_TYPE_EXTENSION_ARRAY (garrow_extension_array_get_type())
-G_DECLARE_DERIVABLE_TYPE(GArrowExtensionArray,
-                         garrow_extension_array,
-                         GARROW,
-                         EXTENSION_ARRAY,
-                         GArrowArray)
-struct _GArrowExtensionArrayClass
-{
-  GArrowArrayClass parent_class;
-};
 
 GARROW_AVAILABLE_IN_3_0
 GArrowArray *

@@ -17,8 +17,9 @@
 
 # cython: language_level = 3
 
-"""Dataset support for Parquest file format."""
+"""Dataset support for Parquet file format."""
 
+from cython cimport binding
 from cython.operator cimport dereference as deref
 
 import os
@@ -31,7 +32,6 @@ from pyarrow.includes.libarrow cimport *
 from pyarrow.includes.libarrow_dataset cimport *
 from pyarrow.includes.libarrow_dataset_parquet cimport *
 from pyarrow._fs cimport FileSystem
-from pyarrow.util import _is_path_like, _stringify_path
 
 from pyarrow._compute cimport Expression, _bind
 from pyarrow._dataset cimport (
@@ -42,20 +42,28 @@ from pyarrow._dataset cimport (
     FileWriteOptions,
     Fragment,
     FragmentScanOptions,
+    CacheOptions,
     Partitioning,
     PartitioningFactory,
     WrittenFile
 )
 
-
 from pyarrow._parquet cimport (
     _create_writer_properties, _create_arrow_writer_properties,
-    FileMetaData, RowGroupMetaData, ColumnChunkMetaData
+    FileMetaData,
 )
 
 
-cdef Expression _true = Expression._scalar(True)
+try:
+    from pyarrow._dataset_parquet_encryption import (
+        set_encryption_config, set_decryption_config
+    )
+    parquet_encryption_enabled = True
+except ImportError:
+    parquet_encryption_enabled = False
 
+
+cdef Expression _true = Expression._scalar(True)
 
 ctypedef CParquetFileWriter* _CParquetFileWriterPtr
 
@@ -71,14 +79,15 @@ cdef class ParquetFileFormat(FileFormat):
     default_fragment_scan_options : ParquetFragmentScanOptions
         Scan Options for the file.
     **kwargs : dict
-        Additional options for read option or scan option.
+        Additional options for read option or scan option
     """
 
     cdef:
         CParquetFileFormat* parquet_format
 
     def __init__(self, read_options=None,
-                 default_fragment_scan_options=None, **kwargs):
+                 default_fragment_scan_options=None,
+                 **kwargs):
         cdef:
             shared_ptr[CParquetFileFormat] wrapped
             CParquetFileFormatReaderOptions* options
@@ -130,6 +139,7 @@ cdef class ParquetFileFormat(FileFormat):
                             'ParquetFragmentScanOptions')
 
         wrapped = make_shared[CParquetFileFormat]()
+
         options = &(wrapped.get().reader_options)
         if read_options.dictionary_columns is not None:
             for column in read_options.dictionary_columns:
@@ -160,7 +170,9 @@ cdef class ParquetFileFormat(FileFormat):
             parquet_metadata.init(metadata)
             parquet_metadata.set_file_path(os.path.relpath(path, base_dir))
 
-        return WrittenFile(path, parquet_metadata)
+        size = GetResultValue(file_writer.GetBytesWritten())
+
+        return WrittenFile(path, parquet_metadata, size)
 
     @property
     def read_options(self):
@@ -177,6 +189,15 @@ cdef class ParquetFileFormat(FileFormat):
         return parquet_read_options
 
     def make_write_options(self, **kwargs):
+        """
+        Parameters
+        ----------
+        **kwargs : dict
+
+        Returns
+        -------
+        pyarrow.dataset.FileWriteOptions
+        """
         opts = FileFormat.make_write_options(self)
         (<ParquetFileWriteOptions> opts).update(**kwargs)
         return opts
@@ -188,6 +209,15 @@ cdef class ParquetFileFormat(FileFormat):
             super()._set_default_fragment_scan_options(options)
 
     def equals(self, ParquetFileFormat other):
+        """
+        Parameters
+        ----------
+        other : pyarrow.dataset.ParquetFileFormat
+
+        Returns
+        -------
+        bool
+        """
         return (
             self.read_options.equals(other.read_options) and
             self.default_fragment_scan_options ==
@@ -206,18 +236,40 @@ cdef class ParquetFileFormat(FileFormat):
         return f"<ParquetFileFormat read_options={self.read_options}>"
 
     def make_fragment(self, file, filesystem=None,
-                      Expression partition_expression=None, row_groups=None):
+                      Expression partition_expression=None, row_groups=None, *, file_size=None):
+        """
+        Make a FileFragment from a given file.
+
+        Parameters
+        ----------
+        file : file-like object, path-like or str
+            The file or file path to make a fragment from.
+        filesystem : Filesystem, optional
+            If `filesystem` is given, `file` must be a string and specifies
+            the path of the file to read from the filesystem.
+        partition_expression : Expression, optional
+            An expression that is guaranteed true for all rows in the fragment.  Allows
+            fragment to be potentially skipped while scanning with a filter.
+        row_groups : Iterable, optional
+            The indices of the row groups to include
+        file_size : int, optional
+            The size of the file in bytes. Can improve performance with high-latency filesystems
+            when file size needs to be known before reading.
+
+        Returns
+        -------
+        fragment : Fragment
+            The file fragment
+        """
         cdef:
             vector[int] c_row_groups
-
         if partition_expression is None:
             partition_expression = _true
-
         if row_groups is None:
             return super().make_fragment(file, filesystem,
-                                         partition_expression)
+                                         partition_expression, file_size=file_size)
 
-        c_source = _make_file_source(file, filesystem)
+        c_source = _make_file_source(file, filesystem, file_size)
         c_row_groups = [<int> row_group for row_group in set(row_groups)]
 
         c_fragment = <shared_ptr[CFragment]> GetResultValue(
@@ -234,9 +286,12 @@ class RowGroupInfo:
 
     Parameters
     ----------
-    id : the group id.
-    metadata : the rowgroup metadata.
-    schema : schema of the rows.
+    id : integer
+        The group ID.
+    metadata : FileMetaData
+        The rowgroup metadata.
+    schema : Schema
+        Schema of the rows.
     """
 
     def __init__(self, id, metadata, schema):
@@ -301,7 +356,13 @@ cdef class ParquetFileFragment(FileFragment):
 
     def __reduce__(self):
         buffer = self.buffer
-        row_groups = [row_group.id for row_group in self.row_groups]
+        # parquet_file_fragment.row_groups() is empty if the metadata
+        # information of the file is not yet populated
+        if not bool(self.parquet_file_fragment.row_groups()):
+            row_groups = None
+        else:
+            row_groups = [row_group.id for row_group in self.row_groups]
+
         return self.format.make_fragment, (
             self.path if buffer is None else buffer,
             self.filesystem,
@@ -314,7 +375,8 @@ cdef class ParquetFileFragment(FileFragment):
         Ensure that all metadata (statistics, physical schema, ...) have
         been read and cached in this fragment.
         """
-        check_status(self.parquet_file_fragment.EnsureCompleteMetadata())
+        with nogil:
+            check_status(self.parquet_file_fragment.EnsureCompleteMetadata())
 
     @property
     def row_groups(self):
@@ -355,7 +417,7 @@ cdef class ParquetFileFragment(FileFragment):
             the Parquet RowGroup statistics).
         schema : Schema, default None
             Schema to use when filtering row groups. Defaults to the
-            Fragment's phsyical schema
+            Fragment's physical schema
 
         Returns
         -------
@@ -390,7 +452,7 @@ cdef class ParquetFileFragment(FileFragment):
             the Parquet RowGroup statistics).
         schema : Schema, default None
             Schema to use when filtering row groups. Defaults to the
-            Fragment's phsyical schema
+            Fragment's physical schema
         row_group_ids : list of ints
             The row group IDs to include in the subset. Can only be specified
             if `filter` is None.
@@ -440,12 +502,12 @@ cdef class ParquetReadOptions(_Weakrefable):
     ----------
     dictionary_columns : list of string, default None
         Names of columns which should be dictionary encoded as
-        they are read.
-    coerce_int96_timestamp_unit : str, default None.
+        they are read
+    coerce_int96_timestamp_unit : str, default None
         Cast timestamps that are stored in INT96 format to a particular
         resolution (e.g. 'ms'). Setting to None is equivalent to 'ns'
         and therefore INT96 timestamps will be inferred as timestamps
-        in nanoseconds.
+        in nanoseconds
     """
 
     cdef public:
@@ -470,6 +532,15 @@ cdef class ParquetReadOptions(_Weakrefable):
             self._coerce_int96_timestamp_unit = TimeUnit_NANO
 
     def equals(self, ParquetReadOptions other):
+        """
+        Parameters
+        ----------
+        other : pyarrow.dataset.ParquetReadOptions
+
+        Returns
+        -------
+        bool
+        """
         return (self.dictionary_columns == other.dictionary_columns and
                 self.coerce_int96_timestamp_unit ==
                 other.coerce_int96_timestamp_unit)
@@ -490,15 +561,17 @@ cdef class ParquetReadOptions(_Weakrefable):
 
 cdef class ParquetFileWriteOptions(FileWriteOptions):
 
-    cdef:
-        CParquetFileWriteOptions* parquet_options
-        object _properties
-
     def update(self, **kwargs):
+        """
+        Parameters
+        ----------
+        **kwargs : dict
+        """
         arrow_fields = {
             "use_deprecated_int96_timestamps",
             "coerce_timestamps",
             "allow_truncated_timestamps",
+            "use_compliant_nested_type",
         }
 
         setters = set()
@@ -508,6 +581,8 @@ cdef class ParquetFileWriteOptions(FileWriteOptions):
             self._properties[name] = value
             if name in arrow_fields:
                 setters.add(self._set_arrow_properties)
+            elif name == "encryption_config" and value is not None:
+                setters.add(self._set_encryption_config)
             else:
                 setters.add(self._set_properties)
 
@@ -529,6 +604,12 @@ cdef class ParquetFileWriteOptions(FileWriteOptions):
             ),
             column_encoding=self._properties["column_encoding"],
             data_page_version=self._properties["data_page_version"],
+            encryption_properties=self._properties["encryption_properties"],
+            write_batch_size=self._properties["write_batch_size"],
+            dictionary_pagesize_limit=self._properties["dictionary_pagesize_limit"],
+            write_page_index=self._properties["write_page_index"],
+            write_page_checksum=self._properties["write_page_checksum"],
+            sorting_columns=self._properties["sorting_columns"],
         )
 
     def _set_arrow_properties(self):
@@ -548,13 +629,21 @@ cdef class ParquetFileWriteOptions(FileWriteOptions):
             )
         )
 
+    def _set_encryption_config(self):
+        if not parquet_encryption_enabled:
+            raise NotImplementedError(
+                "Encryption is not enabled in your installation of pyarrow, but an "
+                "encryption_config was provided."
+            )
+        set_encryption_config(self, self._properties["encryption_config"])
+
     cdef void init(self, const shared_ptr[CFileWriteOptions]& sp):
         FileWriteOptions.init(self, sp)
         self.parquet_options = <CParquetFileWriteOptions*> sp.get()
         self._properties = dict(
             use_dictionary=True,
             compression="snappy",
-            version="1.0",
+            version="2.6",
             write_statistics=None,
             data_page_size=None,
             compression_level=None,
@@ -564,10 +653,23 @@ cdef class ParquetFileWriteOptions(FileWriteOptions):
             use_deprecated_int96_timestamps=False,
             coerce_timestamps=None,
             allow_truncated_timestamps=False,
-            use_compliant_nested_type=False,
+            use_compliant_nested_type=True,
+            encryption_properties=None,
+            write_batch_size=None,
+            dictionary_pagesize_limit=None,
+            write_page_index=False,
+            encryption_config=None,
+            write_page_checksum=False,
+            sorting_columns=None,
         )
+
         self._set_properties()
         self._set_arrow_properties()
+
+    def __repr__(self):
+        return "<pyarrow.dataset.ParquetFileWriteOptions {0}>".format(
+            " ".join([f"{key}={value}" for key, value in self._properties.items()])
+        )
 
 
 cdef set _PARQUET_READ_OPTIONS = {
@@ -587,34 +689,57 @@ cdef class ParquetFragmentScanOptions(FragmentScanOptions):
         Disabled by default.
     buffer_size : int, default 8192
         Size of buffered stream, if enabled. Default is 8KB.
-    pre_buffer : bool, default False
+    pre_buffer : bool, default True
         If enabled, pre-buffer the raw Parquet data instead of issuing one
         read per column chunk. This can improve performance on high-latency
-        filesystems.
-    enable_parallel_column_conversion : bool, default False
-        EXPERIMENTAL: Parallelize conversion across columns. This option is
-        ignored if a scan is already parallelized across input files to avoid
-        thread contention. This option will be removed after support is added
-        for simultaneous parallelization across files and columns.
+        filesystems (e.g. S3, GCS) by coalescing and issuing file reads in
+        parallel using a background I/O thread pool.
+        Set to False if you want to prioritize minimal memory usage
+        over maximum speed.
+    cache_options : pyarrow.CacheOptions, default None
+        Cache options used when pre_buffer is enabled. The default values should
+        be good for most use cases. You may want to adjust these for example if
+        you have exceptionally high latency to the file system. 
+    thrift_string_size_limit : int, default None
+        If not None, override the maximum total string size allocated
+        when decoding Thrift structures. The default limit should be
+        sufficient for most Parquet files.
+    thrift_container_size_limit : int, default None
+        If not None, override the maximum total size of containers allocated
+        when decoding Thrift structures. The default limit should be
+        sufficient for most Parquet files.
+    decryption_config : pyarrow.dataset.ParquetDecryptionConfig, default None
+        If not None, use the provided ParquetDecryptionConfig to decrypt the
+        Parquet file.
+    page_checksum_verification : bool, default False
+        If True, verify the page checksum for each page read from the file.
     """
-
-    cdef:
-        CParquetFragmentScanOptions* parquet_options
 
     # Avoid mistakingly creating attributes
     __slots__ = ()
 
-    def __init__(self, bint use_buffered_stream=False,
+    def __init__(self, *, bint use_buffered_stream=False,
                  buffer_size=8192,
-                 bint pre_buffer=False,
-                 bint enable_parallel_column_conversion=False):
+                 bint pre_buffer=True,
+                 cache_options=None,
+                 thrift_string_size_limit=None,
+                 thrift_container_size_limit=None,
+                 decryption_config=None,
+                 bint page_checksum_verification=False):
         self.init(shared_ptr[CFragmentScanOptions](
             new CParquetFragmentScanOptions()))
         self.use_buffered_stream = use_buffered_stream
         self.buffer_size = buffer_size
         self.pre_buffer = pre_buffer
-        self.enable_parallel_column_conversion = \
-            enable_parallel_column_conversion
+        if cache_options is not None:
+            self.cache_options = cache_options
+        if thrift_string_size_limit is not None:
+            self.thrift_string_size_limit = thrift_string_size_limit
+        if thrift_container_size_limit is not None:
+            self.thrift_container_size_limit = thrift_container_size_limit
+        if decryption_config is not None:
+            self.parquet_decryption_config = decryption_config
+        self.page_checksum_verification = page_checksum_verification
 
     cdef void init(self, const shared_ptr[CFragmentScanOptions]& sp):
         FragmentScanOptions.init(self, sp)
@@ -656,29 +781,98 @@ cdef class ParquetFragmentScanOptions(FragmentScanOptions):
         self.arrow_reader_properties().set_pre_buffer(pre_buffer)
 
     @property
-    def enable_parallel_column_conversion(self):
-        return self.parquet_options.enable_parallel_column_conversion
+    def cache_options(self):
+        return CacheOptions.wrap(self.arrow_reader_properties().cache_options())
 
-    @enable_parallel_column_conversion.setter
-    def enable_parallel_column_conversion(
-            self, bint enable_parallel_column_conversion):
-        self.parquet_options.enable_parallel_column_conversion = \
-            enable_parallel_column_conversion
+    @cache_options.setter
+    def cache_options(self, CacheOptions options):
+        self.arrow_reader_properties().set_cache_options(options.unwrap())
+
+    @property
+    def thrift_string_size_limit(self):
+        return self.reader_properties().thrift_string_size_limit()
+
+    @thrift_string_size_limit.setter
+    def thrift_string_size_limit(self, size):
+        if size <= 0:
+            raise ValueError("size must be larger than zero")
+        self.reader_properties().set_thrift_string_size_limit(size)
+
+    @property
+    def thrift_container_size_limit(self):
+        return self.reader_properties().thrift_container_size_limit()
+
+    @thrift_container_size_limit.setter
+    def thrift_container_size_limit(self, size):
+        if size <= 0:
+            raise ValueError("size must be larger than zero")
+        self.reader_properties().set_thrift_container_size_limit(size)
+
+    @property
+    def parquet_decryption_config(self):
+        if not parquet_encryption_enabled:
+            raise NotImplementedError(
+                "Unable to access encryption features. "
+                "Encryption is not enabled in your installation of pyarrow."
+            )
+        return self._parquet_decryption_config
+
+    @parquet_decryption_config.setter
+    def parquet_decryption_config(self, config):
+        if not parquet_encryption_enabled:
+            raise NotImplementedError(
+                "Encryption is not enabled in your installation of pyarrow, but a "
+                "decryption_config was provided."
+            )
+        set_decryption_config(self, config)
+        self._parquet_decryption_config = config
+
+    @property
+    def page_checksum_verification(self):
+        return self.reader_properties().page_checksum_verification()
+
+    @page_checksum_verification.setter
+    def page_checksum_verification(self, bint page_checksum_verification):
+        self.reader_properties().set_page_checksum_verification(page_checksum_verification)
 
     def equals(self, ParquetFragmentScanOptions other):
-        return (
-            self.use_buffered_stream == other.use_buffered_stream and
-            self.buffer_size == other.buffer_size and
-            self.pre_buffer == other.pre_buffer and
-            self.enable_parallel_column_conversion ==
-            other.enable_parallel_column_conversion
-        )
+        """
+        Parameters
+        ----------
+        other : pyarrow.dataset.ParquetFragmentScanOptions
+
+        Returns
+        -------
+        bool
+        """
+        attrs = (
+            self.use_buffered_stream, self.buffer_size, self.pre_buffer, self.cache_options,
+            self.thrift_string_size_limit, self.thrift_container_size_limit,
+            self.page_checksum_verification)
+        other_attrs = (
+            other.use_buffered_stream, other.buffer_size, other.pre_buffer, other.cache_options,
+            other.thrift_string_size_limit,
+            other.thrift_container_size_limit, other.page_checksum_verification)
+        return attrs == other_attrs
+
+    @staticmethod
+    @binding(True)  # Required for Cython < 3
+    def _reconstruct(kwargs):
+        # __reduce__ doesn't allow passing named arguments directly to the
+        # reconstructor, hence this wrapper.
+        return ParquetFragmentScanOptions(**kwargs)
 
     def __reduce__(self):
-        return ParquetFragmentScanOptions, (
-            self.use_buffered_stream, self.buffer_size, self.pre_buffer,
-            self.enable_parallel_column_conversion
+        kwargs = dict(
+            use_buffered_stream=self.use_buffered_stream,
+            buffer_size=self.buffer_size,
+            pre_buffer=self.pre_buffer,
+            cache_options=self.cache_options,
+            thrift_string_size_limit=self.thrift_string_size_limit,
+            thrift_container_size_limit=self.thrift_container_size_limit,
+            page_checksum_verification=self.page_checksum_verification
         )
+        return ParquetFragmentScanOptions._reconstruct, (kwargs,)
 
 
 cdef class ParquetFactoryOptions(_Weakrefable):
@@ -748,7 +942,7 @@ cdef class ParquetFactoryOptions(_Weakrefable):
         c_factory = self.options.partitioning.factory()
         if c_factory.get() == nullptr:
             return None
-        return PartitioningFactory.wrap(c_factory)
+        return PartitioningFactory.wrap(c_factory, None, None)
 
     @partitioning_factory.setter
     def partitioning_factory(self, PartitioningFactory value):
@@ -802,7 +996,7 @@ cdef class ParquetDatasetFactory(DatasetFactory):
                  FileFormat format not None,
                  ParquetFactoryOptions options=None):
         cdef:
-            c_string path
+            c_string c_path
             shared_ptr[CFileSystem] c_filesystem
             shared_ptr[CParquetFileFormat] c_format
             CResult[shared_ptr[CDatasetFactory]] result
@@ -815,8 +1009,9 @@ cdef class ParquetDatasetFactory(DatasetFactory):
         options = options or ParquetFactoryOptions()
         c_options = options.unwrap()
 
-        result = CParquetDatasetFactory.MakeFromMetaDataPath(
-            c_path, c_filesystem, c_format, c_options)
+        with nogil:
+            result = CParquetDatasetFactory.MakeFromMetaDataPath(
+                c_path, c_filesystem, c_format, c_options)
         self.init(GetResultValue(result))
 
     cdef init(self, shared_ptr[CDatasetFactory]& sp):

@@ -17,13 +17,25 @@
 
 #include "arrow/engine/substrait/plan_internal.h"
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
+#include "arrow/compute/type_fwd.h"
+#include "arrow/engine/substrait/relation_internal.h"
+#include "arrow/engine/substrait/type_fwd.h"
+#include "arrow/engine/substrait/util.h"
+#include "arrow/engine/substrait/util_internal.h"
 #include "arrow/result.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/hashing.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/make_unique.h"
+#include "arrow/util/macros.h"
 #include "arrow/util/unreachable.h"
 
-#include <unordered_map>
+#include "substrait/extensions/extensions.pb.h"
 
 namespace arrow {
 
@@ -31,132 +43,29 @@ using internal::checked_cast;
 
 namespace engine {
 
-namespace internal {
-using ::arrow::internal::make_unique;
-}  // namespace internal
-
 Status AddExtensionSetToPlan(const ExtensionSet& ext_set, substrait::Plan* plan) {
-  plan->clear_extension_uris();
-
-  std::unordered_map<util::string_view, int, ::arrow::internal::StringViewHash> map;
-
-  auto uris = plan->mutable_extension_uris();
-  uris->Reserve(static_cast<int>(ext_set.uris().size()));
-  for (uint32_t anchor = 0; anchor < ext_set.uris().size(); ++anchor) {
-    auto uri = ext_set.uris()[anchor];
-    if (uri.empty()) continue;
-
-    auto ext_uri = internal::make_unique<substrait::extensions::SimpleExtensionURI>();
-    ext_uri->set_uri(uri.to_string());
-    ext_uri->set_extension_uri_anchor(anchor);
-    uris->AddAllocated(ext_uri.release());
-
-    map[uri] = anchor;
-  }
-
-  auto extensions = plan->mutable_extensions();
-  extensions->Reserve(static_cast<int>(ext_set.num_types() + ext_set.num_functions()));
-
-  using ExtDecl = substrait::extensions::SimpleExtensionDeclaration;
-
-  for (uint32_t anchor = 0; anchor < ext_set.num_types(); ++anchor) {
-    ARROW_ASSIGN_OR_RAISE(auto type_record, ext_set.DecodeType(anchor));
-    if (type_record.id.empty()) continue;
-
-    auto ext_decl = internal::make_unique<ExtDecl>();
-
-    if (type_record.is_variation) {
-      auto type_var = internal::make_unique<ExtDecl::ExtensionTypeVariation>();
-      type_var->set_extension_uri_reference(map[type_record.id.uri]);
-      type_var->set_type_variation_anchor(anchor);
-      type_var->set_name(type_record.id.name.to_string());
-      ext_decl->set_allocated_extension_type_variation(type_var.release());
-    } else {
-      auto type = internal::make_unique<ExtDecl::ExtensionType>();
-      type->set_extension_uri_reference(map[type_record.id.uri]);
-      type->set_type_anchor(anchor);
-      type->set_name(type_record.id.name.to_string());
-      ext_decl->set_allocated_extension_type(type.release());
-    }
-
-    extensions->AddAllocated(ext_decl.release());
-  }
-
-  for (uint32_t anchor = 0; anchor < ext_set.num_functions(); ++anchor) {
-    ARROW_ASSIGN_OR_RAISE(auto function_record, ext_set.DecodeFunction(anchor));
-    if (function_record.id.empty()) continue;
-
-    auto fn = internal::make_unique<ExtDecl::ExtensionFunction>();
-    fn->set_extension_uri_reference(map[function_record.id.uri]);
-    fn->set_function_anchor(anchor);
-    fn->set_name(function_record.id.name.to_string());
-
-    auto ext_decl = internal::make_unique<ExtDecl>();
-    ext_decl->set_allocated_extension_function(fn.release());
-    extensions->AddAllocated(ext_decl.release());
-  }
-
-  return Status::OK();
+  return AddExtensionSetToMessage(ext_set, plan);
 }
-
-namespace {
-template <typename Element, typename T>
-void SetElement(size_t i, const Element& element, std::vector<T>* vector) {
-  DCHECK_LE(i, 1 << 20);
-  if (i >= vector->size()) {
-    vector->resize(i + 1);
-  }
-  (*vector)[i] = static_cast<T>(element);
-}
-}  // namespace
 
 Result<ExtensionSet> GetExtensionSetFromPlan(const substrait::Plan& plan,
-                                             ExtensionIdRegistry* registry) {
-  std::vector<util::string_view> uris;
-  for (const auto& uri : plan.extension_uris()) {
-    SetElement(uri.extension_uri_anchor(), uri.uri(), &uris);
-  }
+                                             const ConversionOptions& conversion_options,
+                                             const ExtensionIdRegistry* registry) {
+  return GetExtensionSetFromMessage(plan, conversion_options, registry);
+}
 
-  // NOTE: it's acceptable to use views to memory owned by plan; ExtensionSet::Make
-  // will only store views to memory owned by registry.
-
-  using Id = ExtensionSet::Id;
-
-  std::vector<Id> type_ids, function_ids;
-  std::vector<bool> type_is_variation;
-  for (const auto& ext : plan.extensions()) {
-    switch (ext.mapping_type_case()) {
-      case substrait::extensions::SimpleExtensionDeclaration::kExtensionTypeVariation: {
-        const auto& type_var = ext.extension_type_variation();
-        util::string_view uri = uris[type_var.extension_uri_reference()];
-        SetElement(type_var.type_variation_anchor(), Id{uri, type_var.name()}, &type_ids);
-        SetElement(type_var.type_variation_anchor(), true, &type_is_variation);
-        break;
-      }
-
-      case substrait::extensions::SimpleExtensionDeclaration::kExtensionType: {
-        const auto& type = ext.extension_type();
-        util::string_view uri = uris[type.extension_uri_reference()];
-        SetElement(type.type_anchor(), Id{uri, type.name()}, &type_ids);
-        SetElement(type.type_anchor(), false, &type_is_variation);
-        break;
-      }
-
-      case substrait::extensions::SimpleExtensionDeclaration::kExtensionFunction: {
-        const auto& fn = ext.extension_function();
-        util::string_view uri = uris[fn.extension_uri_reference()];
-        SetElement(fn.function_anchor(), Id{uri, fn.name()}, &function_ids);
-        break;
-      }
-
-      default:
-        Unreachable();
-    }
-  }
-
-  return ExtensionSet::Make(std::move(uris), std::move(type_ids),
-                            std::move(type_is_variation), std::move(function_ids),
-                            registry);
+Result<std::unique_ptr<substrait::Plan>> PlanToProto(
+    const acero::Declaration& declr, ExtensionSet* ext_set,
+    const ConversionOptions& conversion_options) {
+  auto subs_plan = std::make_unique<substrait::Plan>();
+  subs_plan->set_allocated_version(CreateVersion().release());
+  auto plan_rel = std::make_unique<substrait::PlanRel>();
+  auto rel_root = std::make_unique<substrait::RelRoot>();
+  ARROW_ASSIGN_OR_RAISE(auto rel, ToProto(declr, ext_set, conversion_options));
+  rel_root->set_allocated_input(rel.release());
+  plan_rel->set_allocated_root(rel_root.release());
+  subs_plan->mutable_relations()->AddAllocated(plan_rel.release());
+  RETURN_NOT_OK(AddExtensionSetToPlan(*ext_set, subs_plan.get()));
+  return std::move(subs_plan);
 }
 
 }  // namespace engine

@@ -17,13 +17,13 @@
 
 import { targetDir, mainExport, esmRequire, gCCLanguageNames, publicModulePaths, observableFromStreams, shouldRunInChildProcess, spawnGulpCommandInChildProcess } from "./util.js";
 
-import fs from "fs";
-import gulp from "gulp";
-import path from "path";
-import mkdirp from "mkdirp";
-import sourcemaps from "gulp-sourcemaps";
-import { memoizeTask } from "./memoize-task.js";
-import { compileBinFiles } from "./typescript-task.js";
+import fs from 'fs';
+import gulp from 'gulp';
+import path from 'path';
+import { mkdirp } from 'mkdirp';
+import sourcemaps from 'gulp-sourcemaps';
+import { memoizeTask } from './memoize-task.js';
+import { compileBinFiles } from './typescript-task.js';
 
 import closureCompiler from 'google-closure-compiler';
 const compiler = closureCompiler.gulp();
@@ -56,7 +56,8 @@ export const closureTask = ((cache) => memoizeTask(cache, async function closure
 
     return await Promise.all([
         runClosureCompileAsObservable().toPromise(),
-        compileBinFiles(target, format).toPromise()
+        compileBinFiles(target, format).toPromise(),
+        observableFromStreams(gulp.src(`${src}/**/*.d.ts`), gulp.dest(out)), // copy .d.ts files
     ]);
 
     function runClosureCompileAsObservable() {

@@ -21,7 +21,7 @@
 #include <sys/stat.h>
 #include <sstream>
 
-#include "arrow/compute/exec/expression.h"
+#include "arrow/compute/expression.h"
 #include "arrow/record_batch.h"
 #include "arrow/table.h"
 #include "arrow/type.h"
@@ -101,7 +101,7 @@ class SkyhookDirectObjectAccess {
   }
 
   /// Execute an object class method. It uses the `librados::exec` api to
-  /// perform object clsass method calls on the storage node and
+  /// perform object class method calls on the storage node and
   /// stores the result in an output bufferlist.
   arrow::Status Exec(uint64_t inode, const std::string& fn, ceph::bufferlist& in,
                      ceph::bufferlist& out) {

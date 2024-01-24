@@ -38,6 +38,7 @@
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/string.h"
 #include "arrow/util/ubsan.h"
 #include "arrow/visit_type_inline.h"
 
@@ -51,7 +52,7 @@ namespace arrow {
 
 namespace flatbuf = org::apache::arrow::flatbuf;
 using internal::checked_cast;
-using internal::GetByteWidth;
+using internal::ToChars;
 
 namespace ipc {
 namespace internal {
@@ -257,6 +258,9 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
     case flatbuf::Type::LargeBinary:
       *out = large_binary();
       return Status::OK();
+    case flatbuf::Type::BinaryView:
+      *out = binary_view();
+      return Status::OK();
     case flatbuf::Type::FixedSizeBinary: {
       auto fw_binary = static_cast<const flatbuf::FixedSizeBinary*>(type_data);
       return FixedSizeBinaryType::Make(fw_binary->byteWidth()).Value(out);
@@ -266,6 +270,9 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
       return Status::OK();
     case flatbuf::Type::LargeUtf8:
       *out = large_utf8();
+      return Status::OK();
+    case flatbuf::Type::Utf8View:
+      *out = utf8_view();
       return Status::OK();
     case flatbuf::Type::Bool:
       *out = boolean();
@@ -354,6 +361,18 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
       }
       *out = std::make_shared<LargeListType>(children[0]);
       return Status::OK();
+    case flatbuf::Type::ListView:
+      if (children.size() != 1) {
+        return Status::Invalid("ListView must have exactly 1 child field");
+      }
+      *out = std::make_shared<ListViewType>(children[0]);
+      return Status::OK();
+    case flatbuf::Type::LargeListView:
+      if (children.size() != 1) {
+        return Status::Invalid("LargeListView must have exactly 1 child field");
+      }
+      *out = std::make_shared<LargeListViewType>(children[0]);
+      return Status::OK();
     case flatbuf::Type::Map:
       if (children.size() != 1) {
         return Status::Invalid("Map must have exactly 1 child field");
@@ -366,8 +385,8 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
         return Status::Invalid("Map's keys must be non-nullable");
       } else {
         auto map = static_cast<const flatbuf::Map*>(type_data);
-        *out = std::make_shared<MapType>(children[0]->type()->field(0)->type(),
-                                         children[0]->type()->field(1)->type(),
+        *out = std::make_shared<MapType>(children[0]->type()->field(0)->WithName("key"),
+                                         children[0]->type()->field(1)->WithName("value"),
                                          map->keysSorted());
       }
       return Status::OK();
@@ -385,9 +404,19 @@ Status ConcreteTypeFromFlatbuffer(flatbuf::Type type, const void* type_data,
     case flatbuf::Type::Union:
       return UnionFromFlatbuffer(static_cast<const flatbuf::Union*>(type_data), children,
                                  out);
+    case flatbuf::Type::RunEndEncoded:
+      if (children.size() != 2) {
+        return Status::Invalid("RunEndEncoded must have exactly 2 child fields");
+      }
+      if (!is_run_end_type(children[0]->type()->id())) {
+        return Status::Invalid(
+            "RunEndEncoded run_ends field must be typed as: int16, int32, or int64");
+      }
+      *out =
+          std::make_shared<RunEndEncodedType>(children[0]->type(), children[1]->type());
+      return Status::OK();
     default:
-      return Status::Invalid("Unrecognized type:" +
-                             std::to_string(static_cast<int>(type)));
+      return Status::Invalid("Unrecognized type: " + ToChars(static_cast<int>(type)));
   }
 }
 
@@ -523,6 +552,18 @@ class FieldToFlatbufferVisitor {
     return Status::OK();
   }
 
+  Status Visit(const BinaryViewType& type) {
+    fb_type_ = flatbuf::Type::BinaryView;
+    type_offset_ = flatbuf::CreateBinaryView(fbb_).Union();
+    return Status::OK();
+  }
+
+  Status Visit(const StringViewType& type) {
+    fb_type_ = flatbuf::Type::Utf8View;
+    type_offset_ = flatbuf::CreateUtf8View(fbb_).Union();
+    return Status::OK();
+  }
+
   Status Visit(const LargeBinaryType& type) {
     fb_type_ = flatbuf::Type::LargeBinary;
     type_offset_ = flatbuf::CreateLargeBinary(fbb_).Union();
@@ -640,6 +681,20 @@ class FieldToFlatbufferVisitor {
     return Status::OK();
   }
 
+  Status Visit(const ListViewType& type) {
+    fb_type_ = flatbuf::Type::ListView;
+    RETURN_NOT_OK(VisitChildFields(type));
+    type_offset_ = flatbuf::CreateListView(fbb_).Union();
+    return Status::OK();
+  }
+
+  Status Visit(const LargeListViewType& type) {
+    fb_type_ = flatbuf::Type::LargeListView;
+    RETURN_NOT_OK(VisitChildFields(type));
+    type_offset_ = flatbuf::CreateListView(fbb_).Union();
+    return Status::OK();
+  }
+
   Status Visit(const MapType& type) {
     fb_type_ = flatbuf::Type::Map;
     RETURN_NOT_OK(VisitChildFields(type));
@@ -688,6 +743,13 @@ class FieldToFlatbufferVisitor {
     // pass through to the value type, as we've already captured the index
     // type in the DictionaryEncoding metadata in the parent field
     return VisitType(*checked_cast<const DictionaryType&>(type).value_type());
+  }
+
+  Status Visit(const RunEndEncodedType& type) {
+    fb_type_ = flatbuf::Type::RunEndEncoded;
+    RETURN_NOT_OK(VisitChildFields(type));
+    type_offset_ = flatbuf::CreateRunEndEncoded(fbb_).Union();
+    return Status::OK();
   }
 
   Status Visit(const ExtensionType& type) {
@@ -949,6 +1011,7 @@ static Status GetBodyCompression(FBB& fbb, const IpcWriteOptions& options,
 static Status MakeRecordBatch(FBB& fbb, int64_t length, int64_t body_length,
                               const std::vector<FieldMetadata>& nodes,
                               const std::vector<BufferMetadata>& buffers,
+                              const std::vector<int64_t>& variadic_buffer_counts,
                               const IpcWriteOptions& options, RecordBatchOffset* offset) {
   FieldNodeVector fb_nodes;
   RETURN_NOT_OK(WriteFieldNodes(fbb, nodes, &fb_nodes));
@@ -959,7 +1022,13 @@ static Status MakeRecordBatch(FBB& fbb, int64_t length, int64_t body_length,
   BodyCompressionOffset fb_compression;
   RETURN_NOT_OK(GetBodyCompression(fbb, options, &fb_compression));
 
-  *offset = flatbuf::CreateRecordBatch(fbb, length, fb_nodes, fb_buffers, fb_compression);
+  flatbuffers::Offset<flatbuffers::Vector<int64_t>> fb_variadic_buffer_counts{};
+  if (!variadic_buffer_counts.empty()) {
+    fb_variadic_buffer_counts = fbb.CreateVector(variadic_buffer_counts);
+  }
+
+  *offset = flatbuf::CreateRecordBatch(fbb, length, fb_nodes, fb_buffers, fb_compression,
+                                       fb_variadic_buffer_counts);
   return Status::OK();
 }
 
@@ -1055,8 +1124,8 @@ Status MakeSparseTensorIndexCSF(FBB& fbb, const SparseCSFIndex& sparse_index,
   auto indices_type_offset = flatbuf::CreateInt(fbb, indices_value_type.bit_width(),
                                                 indices_value_type.is_signed());
 
-  const int64_t indptr_elem_size = GetByteWidth(indptr_value_type);
-  const int64_t indices_elem_size = GetByteWidth(indices_value_type);
+  const int64_t indptr_elem_size = indptr_value_type.byte_width();
+  const int64_t indices_elem_size = indices_value_type.byte_width();
 
   int64_t offset = 0;
   std::vector<flatbuf::Buffer> indptr, indices;
@@ -1206,11 +1275,12 @@ Status WriteRecordBatchMessage(
     int64_t length, int64_t body_length,
     const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
     const std::vector<FieldMetadata>& nodes, const std::vector<BufferMetadata>& buffers,
-    const IpcWriteOptions& options, std::shared_ptr<Buffer>* out) {
+    const std::vector<int64_t>& variadic_buffer_counts, const IpcWriteOptions& options,
+    std::shared_ptr<Buffer>* out) {
   FBB fbb;
   RecordBatchOffset record_batch;
-  RETURN_NOT_OK(
-      MakeRecordBatch(fbb, length, body_length, nodes, buffers, options, &record_batch));
+  RETURN_NOT_OK(MakeRecordBatch(fbb, length, body_length, nodes, buffers,
+                                variadic_buffer_counts, options, &record_batch));
   return WriteFBMessage(fbb, flatbuf::MessageHeader::RecordBatch, record_batch.Union(),
                         body_length, options.metadata_version, custom_metadata,
                         options.memory_pool)
@@ -1224,7 +1294,7 @@ Result<std::shared_ptr<Buffer>> WriteTensorMessage(const Tensor& tensor,
   using TensorOffset = flatbuffers::Offset<flatbuf::Tensor>;
 
   FBB fbb;
-  const int elem_size = GetByteWidth(*tensor.type());
+  const int elem_size = tensor.type()->byte_width();
 
   flatbuf::Type fb_type_type;
   Offset fb_type;
@@ -1267,11 +1337,12 @@ Status WriteDictionaryMessage(
     int64_t id, bool is_delta, int64_t length, int64_t body_length,
     const std::shared_ptr<const KeyValueMetadata>& custom_metadata,
     const std::vector<FieldMetadata>& nodes, const std::vector<BufferMetadata>& buffers,
-    const IpcWriteOptions& options, std::shared_ptr<Buffer>* out) {
+    const std::vector<int64_t>& variadic_buffer_counts, const IpcWriteOptions& options,
+    std::shared_ptr<Buffer>* out) {
   FBB fbb;
   RecordBatchOffset record_batch;
-  RETURN_NOT_OK(
-      MakeRecordBatch(fbb, length, body_length, nodes, buffers, options, &record_batch));
+  RETURN_NOT_OK(MakeRecordBatch(fbb, length, body_length, nodes, buffers,
+                                variadic_buffer_counts, options, &record_batch));
   auto dictionary_batch =
       flatbuf::CreateDictionaryBatch(fbb, id, record_batch, is_delta).Union();
   return WriteFBMessage(fbb, flatbuf::MessageHeader::DictionaryBatch, dictionary_batch,
@@ -1352,7 +1423,7 @@ Status GetSchema(const void* opaque_schema, DictionaryMemo* dictionary_memo,
 
   std::shared_ptr<KeyValueMetadata> metadata;
   RETURN_NOT_OK(internal::GetKeyValueMetadata(schema->custom_metadata(), &metadata));
-  // set endianess using the value in flatbuf schema
+  // set endianness using the value in flatbuf schema
   auto endianness = schema->endianness() == flatbuf::Endianness::Little
                         ? Endianness::Little
                         : Endianness::Big;

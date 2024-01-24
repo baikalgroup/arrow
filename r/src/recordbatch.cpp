@@ -17,8 +17,6 @@
 
 #include "./arrow_types.h"
 
-#if defined(ARROW_R_WITH_ARROW)
-
 #include <arrow/array/array_base.h>
 #include <arrow/io/file.h>
 #include <arrow/io/memory.h>
@@ -34,8 +32,8 @@ int RecordBatch__num_columns(const std::shared_ptr<arrow::RecordBatch>& x) {
 }
 
 // [[arrow::export]]
-int RecordBatch__num_rows(const std::shared_ptr<arrow::RecordBatch>& x) {
-  return x->num_rows();
+r_vec_size RecordBatch__num_rows(const std::shared_ptr<arrow::RecordBatch>& x) {
+  return r_vec_size(x->num_rows());
 }
 
 // [[arrow::export]]
@@ -82,7 +80,7 @@ cpp11::list RecordBatch__columns(const std::shared_ptr<arrow::RecordBatch>& batc
 
 // [[arrow::export]]
 std::shared_ptr<arrow::Array> RecordBatch__column(
-    const std::shared_ptr<arrow::RecordBatch>& batch, R_xlen_t i) {
+    const std::shared_ptr<arrow::RecordBatch>& batch, int i) {
   arrow::r::validate_index(i, batch->num_columns());
   return batch->column(i);
 }
@@ -108,7 +106,7 @@ bool RecordBatch__Equals(const std::shared_ptr<arrow::RecordBatch>& self,
 
 // [[arrow::export]]
 std::shared_ptr<arrow::RecordBatch> RecordBatch__AddColumn(
-    const std::shared_ptr<arrow::RecordBatch>& batch, R_xlen_t i,
+    const std::shared_ptr<arrow::RecordBatch>& batch, int i,
     const std::shared_ptr<arrow::Field>& field,
     const std::shared_ptr<arrow::Array>& column) {
   return ValueOrStop(batch->AddColumn(i, field, column));
@@ -116,7 +114,7 @@ std::shared_ptr<arrow::RecordBatch> RecordBatch__AddColumn(
 
 // [[arrow::export]]
 std::shared_ptr<arrow::RecordBatch> RecordBatch__SetColumn(
-    const std::shared_ptr<arrow::RecordBatch>& batch, R_xlen_t i,
+    const std::shared_ptr<arrow::RecordBatch>& batch, int i,
     const std::shared_ptr<arrow::Field>& field,
     const std::shared_ptr<arrow::Array>& column) {
   return ValueOrStop(batch->SetColumn(i, field, column));
@@ -124,14 +122,14 @@ std::shared_ptr<arrow::RecordBatch> RecordBatch__SetColumn(
 
 // [[arrow::export]]
 std::shared_ptr<arrow::RecordBatch> RecordBatch__RemoveColumn(
-    const std::shared_ptr<arrow::RecordBatch>& batch, R_xlen_t i) {
+    const std::shared_ptr<arrow::RecordBatch>& batch, int i) {
   arrow::r::validate_index(i, batch->num_columns());
   return ValueOrStop(batch->RemoveColumn(i));
 }
 
 // [[arrow::export]]
 std::string RecordBatch__column_name(const std::shared_ptr<arrow::RecordBatch>& batch,
-                                     R_xlen_t i) {
+                                     int i) {
   arrow::r::validate_index(i, batch->num_columns());
   return batch->column_name(i);
 }
@@ -309,9 +307,7 @@ std::shared_ptr<arrow::RecordBatch> RecordBatch__from_arrays(SEXP schema_sxp, SE
 }
 
 // [[arrow::export]]
-int64_t RecordBatch__ReferencedBufferSize(
+r_vec_size RecordBatch__ReferencedBufferSize(
     const std::shared_ptr<arrow::RecordBatch>& batch) {
-  return ValueOrStop(arrow::util::ReferencedBufferSize(*batch));
+  return r_vec_size(ValueOrStop(arrow::util::ReferencedBufferSize(*batch)));
 }
-
-#endif

@@ -27,6 +27,18 @@
 
 #include "./nameof.h"
 
+// Simple dcheck that doesn't use assert (i.e., won't crash the R session)
+// Condition this on our own debug flag to avoid this ending up in any CRAN
+// checks.
+#if defined(ARROW_R_DEBUG)
+#define ARROW_R_DCHECK(EXPR)                                              \
+  do {                                                                    \
+    if (!(EXPR)) Rf_error("Failed DCHECK: %s evaluated to false", #EXPR); \
+  } while (false)
+#else
+#define ARROW_R_DCHECK(EXPR)
+#endif
+
 // borrowed from enc package
 // because R does not make these macros available (i.e. from Defn.h)
 #define UTF8_MASK (1 << 3)
@@ -209,7 +221,13 @@ Pointer r6_to_pointer(SEXP self) {
         cpp11::decay_t<typename std::remove_pointer<Pointer>::type>>();
     cpp11::stop("Invalid R object for %s, must be an ArrowObject", type_name.c_str());
   }
-  void* p = R_ExternalPtrAddr(Rf_findVarInFrame(self, arrow::r::symbols::xp));
+
+  SEXP xp = Rf_findVarInFrame(self, arrow::r::symbols::xp);
+  if (xp == R_NilValue) {
+    cpp11::stop("Invalid: self$`.:xp:.` is NULL");
+  }
+
+  void* p = R_ExternalPtrAddr(xp);
   if (p == nullptr) {
     SEXP klass = Rf_getAttrib(self, R_ClassSymbol);
     cpp11::stop("Invalid <%s>, external pointer to null", CHAR(STRING_ELT(klass, 0)));
@@ -344,6 +362,26 @@ std::vector<T> from_r_list(cpp11::list args) {
 
 bool GetBoolOption(const std::string& name, bool default_);
 
+// A version of vctrs::vec_size() limited to the types that are
+// supported at the C++ level. We currently handle record-style
+// vectors (e.g., POSIXlt) at the R level such that by the time
+// they get to C++ they are just a data.frame. This version also
+// supports long vectors.
+static inline R_xlen_t vec_size(SEXP x) {
+  if (Rf_inherits(x, "data.frame")) {
+    if (Rf_length(x) > 0) {
+      return Rf_xlength(VECTOR_ELT(x, 0));
+    } else {
+      // This will expand the rownames if attr(x, "row.names") is ALTREP;
+      // however, this is probably not an important performance consideration
+      // since zero-column data.frames do not occur in many workflows.
+      return Rf_xlength(Rf_getAttrib(x, R_RowNamesSymbol));
+    }
+  } else {
+    return Rf_xlength(x);
+  }
+}
+
 }  // namespace r
 }  // namespace arrow
 
@@ -407,6 +445,12 @@ cpp11::writable::list to_r_list(const std::vector<std::shared_ptr<T>>& x) {
 }  // namespace r
 }  // namespace arrow
 
+struct r_vec_size {
+  explicit r_vec_size(R_xlen_t x) : value(x) {}
+
+  R_xlen_t value;
+};
+
 namespace cpp11 {
 
 template <typename T>
@@ -426,6 +470,15 @@ enable_if_enum<E, SEXP> as_sexp(E e) {
 template <typename T>
 SEXP as_sexp(const std::shared_ptr<T>& ptr) {
   return cpp11::to_r6<T>(ptr);
+}
+
+inline SEXP as_sexp(r_vec_size size) {
+  R_xlen_t x = size.value;
+  if (x > std::numeric_limits<int>::max()) {
+    return Rf_ScalarReal(x);
+  } else {
+    return Rf_ScalarInteger(static_cast<int>(x));
+  }
 }
 
 }  // namespace cpp11

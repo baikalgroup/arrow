@@ -10,7 +10,8 @@ open_dataset(
   partitioning = hive_partition(),
   hive_style = NA,
   unify_schemas = NULL,
-  format = c("parquet", "arrow", "ipc", "feather", "csv", "tsv", "text"),
+  format = c("parquet", "arrow", "ipc", "feather", "csv", "tsv", "text", "json"),
+  factory_options = list(),
   ...
 )
 }
@@ -73,10 +74,32 @@ only version 2 files are supported
 \item "csv"/"text", aliases for the same thing (because comma is the default
 delimiter for text files
 \item "tsv", equivalent to passing \verb{format = "text", delimiter = "\\t"}
-}
-
+\item "json", for JSON format datasets Note: only newline-delimited JSON (aka ND-JSON) datasets
+are currently supported
 Default is "parquet", unless a \code{delimiter} is also specified, in which case
-it is assumed to be "text".}
+it is assumed to be "text".
+}}
+
+\item{factory_options}{list of optional FileSystemFactoryOptions:
+\itemize{
+\item \code{partition_base_dir}: string path segment prefix to ignore when
+discovering partition information with DirectoryPartitioning. Not
+meaningful (ignored with a warning) for HivePartitioning, nor is it
+valid when providing a vector of file paths.
+\item \code{exclude_invalid_files}: logical: should files that are not valid data
+files be excluded? Default is \code{FALSE} because checking all files up
+front incurs I/O and thus will be slower, especially on remote
+filesystems. If false and there are invalid files, there will be an
+error at scan time. This is the only FileSystemFactoryOption that is
+valid for both when providing a directory path in which to discover
+files and when providing a vector of file paths.
+\item \code{selector_ignore_prefixes}: character vector of file prefixes to ignore
+when discovering files in a directory. If invalid files can be excluded
+by a common filename prefix this way, you can avoid the I/O cost of
+\code{exclude_invalid_files}. Not valid when providing a vector of file paths
+(but if you're providing the file list, you can filter invalid files
+yourself).
+}}
 
 \item{...}{additional arguments passed to \code{dataset_factory()} when \code{sources}
 is a directory path/URI or vector of file paths/URIs, otherwise ignored.
@@ -119,7 +142,7 @@ what names to give the virtual columns that come from the path segments.
 
 The default behavior in \code{open_dataset()} is to inspect the file paths
 contained in the provided directory, and if they look like Hive-style, parse
-them as Hive. If your dataset has Hive-style partioning in the file paths,
+them as Hive. If your dataset has Hive-style partitioning in the file paths,
 you do not need to provide anything in the \code{partitioning} argument to
 \code{open_dataset()} to use them. If you do provide a character vector of
 partition column names, they will be ignored if they match what is detected,
@@ -145,8 +168,7 @@ tf <- tempfile()
 dir.create(tf)
 on.exit(unlink(tf))
 
-data <- dplyr::group_by(mtcars, cyl)
-write_dataset(data, tf)
+write_dataset(mtcars, tf, partitioning = "cyl")
 
 # You can specify a directory containing the files for your dataset and
 # open_dataset will scan all files in your directory.
@@ -159,7 +181,7 @@ open_dataset(c(file.path(tf, "cyl=4/part-0.parquet"), file.path(tf, "cyl=8/part-
 tf2 <- tempfile()
 dir.create(tf2)
 on.exit(unlink(tf2))
-write_dataset(data, tf2, format = "ipc")
+write_dataset(mtcars, tf2, format = "ipc")
 # This line will results in errors when you try to work with the data
 \dontrun{
 open_dataset(tf2)
@@ -190,5 +212,6 @@ open_dataset(tf3, partitioning = schema(Month = int8(), Day = int8()))
 \dontshow{\}) # examplesIf}
 }
 \seealso{
-\code{vignette("dataset", package = "arrow")}
+\href{https://arrow.apache.org/docs/r/articles/dataset.html}{
+datasets article}
 }

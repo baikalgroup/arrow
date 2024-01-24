@@ -19,19 +19,20 @@ package pqarrow
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/flight"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/apache/arrow/go/v8/parquet/internal/utils"
-	"github.com/apache/arrow/go/v8/parquet/metadata"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/flight"
+	"github.com/apache/arrow/go/v15/internal/utils"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/metadata"
 	"golang.org/x/xerrors"
 )
 
 // WriteTable is a convenience function to create and write a full array.Table to a parquet file. The schema
-// and columns will be determined by the schema of the table, writing the file out to the the provided writer.
+// and columns will be determined by the schema of the table, writing the file out to the provided writer.
 // The chunksize will be utilized in order to determine the size of the row groups.
 func WriteTable(tbl arrow.Table, w io.Writer, chunkSize int64, props *parquet.WriterProperties, arrprops ArrowWriterProperties) error {
 	writer, err := NewFileWriter(tbl.Schema(), w, props, arrprops)
@@ -72,13 +73,13 @@ func NewFileWriter(arrschema *arrow.Schema, w io.Writer, props *parquet.WriterPr
 	}
 
 	meta := make(metadata.KeyValueMetadata, 0)
-	if arrprops.storeSchema {
-		for i := 0; i < arrschema.Metadata().Len(); i++ {
-			meta.Append(arrschema.Metadata().Keys()[i], arrschema.Metadata().Values()[i])
-		}
+	for i := 0; i < arrschema.Metadata().Len(); i++ {
+		meta.Append(arrschema.Metadata().Keys()[i], arrschema.Metadata().Values()[i])
+	}
 
+	if arrprops.storeSchema {
 		serializedSchema := flight.SerializeSchema(arrschema, props.Allocator())
-		meta.Append("ARROW:schema", base64.RawStdEncoding.EncodeToString(serializedSchema))
+		meta.Append("ARROW:schema", base64.StdEncoding.EncodeToString(serializedSchema))
 	}
 
 	schemaNode := pqschema.Root()
@@ -104,7 +105,7 @@ func (fw *FileWriter) NewRowGroup() {
 
 // NewBufferedRowGroup starts a new memory Buffered Row Group to allow writing columns / records
 // without immediately flushing them to disk. This allows using WriteBuffered to write records
-// and decide where to break your rowgroup based on the TotalBytesWritten rather than on the max
+// and decide where to break your row group based on the TotalBytesWritten rather than on the max
 // row group len. If using Records, this should be paired with WriteBuffered, while
 // Write will always write a new record as a row group in and of itself.
 func (fw *FileWriter) NewBufferedRowGroup() {
@@ -133,9 +134,39 @@ func (fw *FileWriter) RowGroupTotalBytesWritten() int64 {
 	return 0
 }
 
+// RowGroupNumRows returns the number of rows written to the current row group.
+// Returns an error if they are unequal between columns that have been written so far.
+func (fw *FileWriter) RowGroupNumRows() (int, error) {
+	if fw.rgw != nil {
+		return fw.rgw.NumRows()
+	}
+	return 0, nil
+}
+
+// NumRows returns the total number of rows that have been written so far.
+func (fw *FileWriter) NumRows() int {
+	if fw.wr != nil {
+		return fw.wr.NumRows()
+	}
+	return 0
+}
+
+// WriteBuffered will either append to an existing row group or create a new one
+// based on the record length and max row group length.
+//
+// Additionally, it allows to manually break your row group by
+// checking RowGroupTotalBytesWritten and calling NewBufferedRowGroup,
+// while Write will always create at least 1 row group for the record.
+//
+// Performance-wise WriteBuffered might be more favorable than Write if you're dealing with:
+// * a loose memory environment (meaning you have a lot of memory to utilize)
+// * records that have only a small (~<1K?) amount of rows
+//
+// More memory is utilized compared to Write as the whole row group data is kept in memory before it's written
+// since Parquet files must have an entire column written before writing the next column.
 func (fw *FileWriter) WriteBuffered(rec arrow.Record) error {
 	if !rec.Schema().Equal(fw.schema) {
-		return xerrors.Errorf("record schema does not match writer's. \nrecord: %s\nwriter: %s", rec.Schema(), fw.schema)
+		return fmt.Errorf("record schema does not match writer's. \nrecord: %s\nwriter: %s", rec.Schema(), fw.schema)
 	}
 
 	var (
@@ -180,10 +211,16 @@ func (fw *FileWriter) WriteBuffered(rec arrow.Record) error {
 }
 
 // Write an arrow Record Batch to the file, respecting the MaxRowGroupLength in the writer
-// properties to determine whether or not a new row group is created while writing.
+// properties to determine whether the record is broken up into more than one row group.
+// At the very least a single row group is created per record,
+// so calling Write always results in a new row group added.
+//
+// Performance-wise Write might be more favorable than WriteBuffered if you're dealing with:
+// * a highly-restricted memory environment
+// * very large records with lots of rows (potentially close to the max row group length)
 func (fw *FileWriter) Write(rec arrow.Record) error {
 	if !rec.Schema().Equal(fw.schema) {
-		return xerrors.Errorf("record schema does not match writer's. \nrecord: %s\nwriter: %s", rec.Schema(), fw.schema)
+		return fmt.Errorf("record schema does not match writer's. \nrecord: %s\nwriter: %s", rec.Schema(), fw.schema)
 	}
 
 	var recList []arrow.Record
@@ -220,7 +257,7 @@ func (fw *FileWriter) WriteTable(tbl arrow.Table, chunkSize int64) error {
 	if chunkSize <= 0 && tbl.NumRows() > 0 {
 		return xerrors.New("chunk size per row group must be greater than 0")
 	} else if !tbl.Schema().Equal(fw.schema) {
-		return xerrors.Errorf("table schema does not match writer's. \nTable: %s\n writer: %s", tbl.Schema(), fw.schema)
+		return fmt.Errorf("table schema does not match writer's. \nTable: %s\n writer: %s", tbl.Schema(), fw.schema)
 	} else if chunkSize > fw.wr.Properties().MaxRowGroupLength() {
 		chunkSize = fw.wr.Properties().MaxRowGroupLength()
 	}
@@ -252,6 +289,11 @@ func (fw *FileWriter) WriteTable(tbl arrow.Table, chunkSize int64) error {
 	return nil
 }
 
+// AppendKeyValueMetadata appends a key/value pair to the existing key/value metadata
+func (fw *FileWriter) AppendKeyValueMetadata(key string, value string) error {
+	return fw.wr.AppendKeyValueMetadata(key, value)
+}
+
 // Close flushes out the data and closes the file. It can be called multiple times,
 // subsequent calls after the first will have no effect.
 func (fw *FileWriter) Close() error {
@@ -262,6 +304,13 @@ func (fw *FileWriter) Close() error {
 				return err
 			}
 		}
+
+		writeCtx := arrowCtxFromContext(fw.ctx)
+		if writeCtx.dataBuffer != nil {
+			writeCtx.dataBuffer.Release()
+			writeCtx.dataBuffer = nil
+		}
+
 		return fw.wr.Close()
 	}
 	return nil
@@ -273,7 +322,7 @@ func (fw *FileWriter) Close() error {
 // building of writing columns to a file via arrow data without needing to already have
 // a record or table.
 func (fw *FileWriter) WriteColumnChunked(data *arrow.Chunked, offset, size int64) error {
-	acw, err := NewArrowColumnWriter(data, offset, size, fw.manifest, fw.rgw, fw.colIdx)
+	acw, err := newArrowColumnWriter(data, offset, size, fw.manifest, fw.rgw, fw.colIdx)
 	if err != nil {
 		return err
 	}

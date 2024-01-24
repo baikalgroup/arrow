@@ -134,8 +134,14 @@ def check_env_var(name, expected, *, expect_warning=False):
         res.check_returncode()  # fail
     errlines = res.stderr.splitlines()
     if expect_warning:
-        assert len(errlines) == 1
-        assert f"Unsupported backend '{name}'" in errlines[0]
+        assert len(errlines) in (1, 2)
+        if len(errlines) == 1:
+            # ARROW_USE_GLOG=OFF
+            assert f"Unsupported backend '{name}'" in errlines[0]
+        else:
+            # ARROW_USE_GLOG=ON
+            assert "InitGoogleLogging()" in errlines[0]
+            assert f"Unsupported backend '{name}'" in errlines[1]
     else:
         assert len(errlines) == 0
 
@@ -188,6 +194,10 @@ def run_debug_memory_pool(pool_factory, env_value):
     code = f"""if 1:
         import ctypes
         import pyarrow as pa
+        # ARROW-16873: some Python installs enable faulthandler by default,
+        # which could dump a spurious stack trace if the following crashes
+        import faulthandler
+        faulthandler.disable()
 
         pool = pa.{pool_factory}()
         buf = pa.allocate_buffer(64, memory_pool=pool)
@@ -236,5 +246,10 @@ def test_debug_memory_pool_warn(pool_factory):
 @pytest.mark.parametrize('pool_factory', supported_factories())
 def test_debug_memory_pool_disabled(pool_factory):
     res = run_debug_memory_pool(pool_factory.__name__, "")
-    res.check_returncode()
+    # The subprocess either returned successfully or was killed by a signal
+    # (due to writing out of bounds), depending on the underlying allocator.
+    if os.name == "posix":
+        assert res.returncode <= 0
+    else:
+        res.check_returncode()
     assert res.stderr == ""

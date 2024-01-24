@@ -18,16 +18,17 @@ package testutils
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"reflect"
 
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/compress"
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/apache/arrow/go/v8/parquet/internal/encoding"
-	"github.com/apache/arrow/go/v8/parquet/internal/utils"
-	"github.com/apache/arrow/go/v8/parquet/schema"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/internal/utils"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/compress"
+	"github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/internal/encoding"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -74,7 +75,7 @@ func (d *DataPageBuilder) appendLevels(lvls []int16, maxLvl int16, e parquet.Enc
 func (d *DataPageBuilder) AppendDefLevels(lvls []int16, maxLvl int16) {
 	d.defLvlBytesLen = d.appendLevels(lvls, maxLvl, parquet.Encodings.RLE)
 
-	d.nvals = utils.MaxInt(len(lvls), d.nvals)
+	d.nvals = utils.Max(len(lvls), d.nvals)
 	d.defLvlEncoding = parquet.Encodings.RLE
 	d.hasDefLvls = true
 }
@@ -82,7 +83,7 @@ func (d *DataPageBuilder) AppendDefLevels(lvls []int16, maxLvl int16) {
 func (d *DataPageBuilder) AppendRepLevels(lvls []int16, maxLvl int16) {
 	d.repLvlBytesLen = d.appendLevels(lvls, maxLvl, parquet.Encodings.RLE)
 
-	d.nvals = utils.MaxInt(len(lvls), d.nvals)
+	d.nvals = utils.Max(len(lvls), d.nvals)
 	d.repLvlEncoding = parquet.Encodings.RLE
 	d.hasRepLvls = true
 }
@@ -91,6 +92,9 @@ func (d *DataPageBuilder) AppendValues(desc *schema.Column, values interface{}, 
 	enc := encoding.NewEncoder(desc.PhysicalType(), e, false, desc, mem)
 	var sz int
 	switch v := values.(type) {
+	case []bool:
+		enc.(encoding.BooleanEncoder).Put(v)
+		sz = len(v)
 	case []int32:
 		enc.(encoding.Int32Encoder).Put(v)
 		sz = len(v)
@@ -109,6 +113,8 @@ func (d *DataPageBuilder) AppendValues(desc *schema.Column, values interface{}, 
 	case []parquet.ByteArray:
 		enc.(encoding.ByteArrayEncoder).Put(v)
 		sz = len(v)
+	default:
+		panic(fmt.Sprintf("no testutil data page builder for type %T", values))
 	}
 	buf, _ := enc.FlushValues()
 	_, err := d.sink.Write(buf.Bytes())
@@ -116,7 +122,7 @@ func (d *DataPageBuilder) AppendValues(desc *schema.Column, values interface{}, 
 		panic(err)
 	}
 
-	d.nvals = utils.MaxInt(sz, d.nvals)
+	d.nvals = utils.Max(sz, d.nvals)
 	d.encoding = e
 	d.hasValues = true
 }
@@ -147,6 +153,8 @@ func (d *DictionaryPageBuilder) AppendValues(values interface{}) encoding.Buffer
 		d.traits.(encoding.Float64Encoder).Put(v)
 	case []parquet.ByteArray:
 		d.traits.(encoding.ByteArrayEncoder).Put(v)
+	default:
+		panic(fmt.Sprintf("no testutil dictionary page builder for type %T", values))
 	}
 
 	d.numDictValues = int32(d.traits.NumEntries())
@@ -183,7 +191,7 @@ func MakeDataPage(dataPageVersion parquet.DataPageVersion, d *schema.Column, val
 		num = builder.nvals
 	} else {
 		stream.Write(indexBuffer.Bytes())
-		num = utils.MaxInt(builder.nvals, nvals)
+		num = utils.Max(builder.nvals, nvals)
 	}
 
 	buf := stream.Finish()
@@ -220,7 +228,7 @@ func (m *MockPageReader) Err() error {
 	return m.Called().Error(0)
 }
 
-func (m *MockPageReader) Reset(parquet.ReaderAtSeeker, int64, compress.Compression, *file.CryptoContext) {
+func (m *MockPageReader) Reset(parquet.BufferedReader, int64, compress.Compression, *file.CryptoContext) {
 }
 
 func (m *MockPageReader) SetMaxPageHeaderSize(int) {}

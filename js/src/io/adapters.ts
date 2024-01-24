@@ -71,7 +71,7 @@ function* fromIterable<T extends ArrayBufferViewInput>(source: Iterable<T> | T):
     }
 
     // Yield so the caller can inject the read command before creating the source Iterator
-    ({ cmd, size } = yield <any>null);
+    ({ cmd, size } = (yield (() => <any>null)()) || {cmd: 'read', size: 0});
 
     // initialize the iterator
     const it = toUint8ArrayIterator(source)[Symbol.iterator]();
@@ -117,7 +117,7 @@ async function* fromAsyncIterable<T extends ArrayBufferViewInput>(source: AsyncI
     }
 
     // Yield so the caller can inject the read command before creating the source AsyncIterator
-    ({ cmd, size } = (yield <any>null)!);
+    ({ cmd, size } = (yield (() => <any>null)()) || {cmd: 'read', size: 0});
 
     // initialize the iterator
     const it = toUint8ArrayAsyncIterator(source)[Symbol.asyncIterator]();
@@ -167,7 +167,7 @@ async function* fromDOMStream<T extends ArrayBufferViewInput>(source: ReadableSt
     }
 
     // Yield so the caller can inject the read command before we establish the ReadableStream lock
-    ({ cmd, size } = yield <any>null);
+    ({ cmd, size } = (yield (() => <any>null)()) || {cmd: 'read', size: 0});
 
     // initialize the reader and lock the stream
     const it = new AdaptiveByteReader(source);
@@ -231,11 +231,11 @@ class AdaptiveByteReader<T extends ArrayBufferViewInput> {
         source && (source['locked'] && this.releaseLock());
     }
 
-    async read(size?: number): Promise<ReadableStreamDefaultReadValueResult<Uint8Array>> {
+    async read(size?: number): Promise<ReadableStreamReadValueResult<Uint8Array>> {
         if (size === 0) {
-            return { done: this.reader == null, value: new Uint8Array(0) } as ReadableStreamDefaultReadValueResult<Uint8Array>;
+            return { done: this.reader == null, value: new Uint8Array(0) } as ReadableStreamReadValueResult<Uint8Array>;
         }
-        const result = await this.reader!.read() as ReadableStreamDefaultReadValueResult<any>;
+        const result = await this.reader!.read() as ReadableStreamReadValueResult<any>;
         !result.done && (result.value = toUint8Array(result));
         return result;
     }
@@ -273,7 +273,7 @@ async function* fromNodeStream(stream: NodeJS.ReadableStream): AsyncUint8ArrayGe
 
     // Yield so the caller can inject the read command before we
     // add the listener for the source stream's 'readable' event.
-    ({ cmd, size } = yield <any>null);
+    ({ cmd, size } = (yield (() => <any>null)()) || {cmd: 'read', size: 0});
 
     // ignore stdin if it's a TTY
     if ((stream as any)['isTTY']) {

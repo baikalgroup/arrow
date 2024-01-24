@@ -40,7 +40,9 @@ namespace arrow {
   ACTION(Boolean);                              \
   ARROW_GENERATE_FOR_ALL_NUMERIC_TYPES(ACTION); \
   ACTION(String);                               \
+  ACTION(StringView);                           \
   ACTION(Binary);                               \
+  ACTION(BinaryView);                           \
   ACTION(LargeString);                          \
   ACTION(LargeBinary);                          \
   ACTION(FixedSizeBinary);                      \
@@ -57,12 +59,15 @@ namespace arrow {
   ACTION(Decimal256);                           \
   ACTION(List);                                 \
   ACTION(LargeList);                            \
+  ACTION(ListView);                             \
+  ACTION(LargeListView);                        \
   ACTION(Map);                                  \
   ACTION(FixedSizeList);                        \
   ACTION(Struct);                               \
   ACTION(SparseUnion);                          \
   ACTION(DenseUnion);                           \
   ACTION(Dictionary);                           \
+  ACTION(RunEndEncoded);                        \
   ACTION(Extension)
 
 }  // namespace arrow

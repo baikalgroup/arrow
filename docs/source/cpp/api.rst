@@ -24,6 +24,7 @@ API Reference
 
    api/support
    api/memory
+   api/thread
    api/datatype
    api/array
    api/scalar
@@ -31,6 +32,8 @@ API Reference
    api/table
    api/c_abi
    api/compute
+   api/acero
+   api/gandiva
    api/tensor
    api/utilities
    api/async
@@ -39,5 +42,6 @@ API Reference
    api/formats
    api/cuda
    api/flight
+   api/flightsql
    api/filesystem
    api/dataset

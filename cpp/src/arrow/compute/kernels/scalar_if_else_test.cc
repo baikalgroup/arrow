@@ -26,8 +26,12 @@
 #include "arrow/compute/kernels/test_util.h"
 #include "arrow/compute/registry.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/util/checked_cast.h"
 
 namespace arrow {
+
+using internal::checked_pointer_cast;
+
 namespace compute {
 
 // Helper that combines a dictionary and the value type so it can
@@ -64,10 +68,22 @@ class TestIfElseKernel : public ::testing::Test {};
 template <typename Type>
 class TestIfElsePrimitive : public ::testing::Test {};
 
+// There are a lot of tests here if we cover all the types and it gets slow on valgrind
+// so we override the standard type sets with a smaller range
+#ifdef ARROW_VALGRIND
+using IfElseNumericBasedTypes =
+    ::testing::Types<UInt32Type, FloatType, Date32Type, Time32Type, TimestampType,
+                     MonthIntervalType, DurationType>;
+using BaseBinaryArrowTypes = ::testing::Types<BinaryType>;
+using ListArrowTypes = ::testing::Types<ListType>;
+using IntegralArrowTypes = ::testing::Types<Int32Type>;
+#else
 using IfElseNumericBasedTypes =
     ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type, Int8Type, Int16Type,
                      Int32Type, Int64Type, FloatType, DoubleType, Date32Type, Date64Type,
-                     Time32Type, Time64Type, TimestampType, MonthIntervalType>;
+                     Time32Type, Time64Type, TimestampType, MonthIntervalType,
+                     DurationType>;
+#endif
 
 TYPED_TEST_SUITE(TestIfElsePrimitive, IfElseNumericBasedTypes);
 
@@ -111,75 +127,115 @@ TYPED_TEST(TestIfElsePrimitive, IfElseFixedSizeRand) {
   CheckIfElseOutput(cond, left, right, expected_data);
 }
 
+Datum ArrayOrBroadcastScalar(const Datum& input, int64_t length) {
+  if (input.is_scalar()) {
+    EXPECT_OK_AND_ASSIGN(auto array, MakeArrayFromScalar(*input.scalar(), length));
+    return array;
+  }
+  EXPECT_TRUE(input.is_array());
+  return input;
+}
+
+Result<Datum> ExpectedFromIfElse(
+    const Datum& cond, const Datum& left, const Datum& right,
+    std::shared_ptr<DataType> type,
+    const std::shared_ptr<Array>& expected_if_all_operands_are_arrays) {
+  if (cond.is_scalar() && left.is_scalar() && right.is_scalar()) {
+    const auto& scalar = cond.scalar_as<BooleanScalar>();
+    Datum expected;
+    if (scalar.is_valid) {
+      expected = scalar.value ? left : right;
+    } else {
+      expected = MakeNullScalar(left.type());
+    }
+    if (!left.type()->Equals(*right.type())) {
+      return Cast(expected, CastOptions::Safe(std::move(type)));
+    }
+    return expected;
+  }
+  if (cond.is_array() && left.is_array() && right.is_array()) {
+    return expected_if_all_operands_are_arrays;
+  }
+  // When at least one of the inputs is an array, we expect the output
+  // to be the same as if all the scalars were broadcast to arrays.
+  const auto expected_length =
+      std::max(cond.length(), std::max(left.length(), right.length()));
+  SCOPED_TRACE("IfElseAAACall");
+  return IfElse(ArrayOrBroadcastScalar(cond, expected_length),
+                ArrayOrBroadcastScalar(left, expected_length),
+                ArrayOrBroadcastScalar(right, expected_length));
+}
+
+bool NextScalarOrWholeArray(const std::shared_ptr<Array>& array, int* index, Datum* out) {
+  if (*index <= array->length()) {
+    if (*index < array->length()) {
+      EXPECT_OK_AND_ASSIGN(auto scalar, array->GetScalar(*index));
+      *out = std::move(scalar);
+    } else {
+      *out = array;
+    }
+    *index += 1;
+    return true;
+  }
+  return false;
+}
+
+std::string CodedCallName(const Datum& cond, const Datum& left, const Datum& right) {
+  std::string coded = "IfElse";
+  coded += cond.is_scalar() ? "S" : "A";
+  coded += left.is_scalar() ? "S" : "A";
+  coded += right.is_scalar() ? "S" : "A";
+  coded += "Call";
+  return coded;
+}
+
+void DoCheckWithDifferentShapes(const std::shared_ptr<Array>& cond,
+                                const std::shared_ptr<Array>& left,
+                                const std::shared_ptr<Array>& right,
+                                const std::shared_ptr<Array>& expected) {
+  auto make_trace([&](const char* name, const Datum& datum, int index) {
+    std::string trace = name;
+    trace += " : ";
+    if (datum.is_scalar()) {
+      trace += "Scalar@" + std::to_string(index) + " = " + datum.scalar()->ToString();
+    } else {
+      EXPECT_TRUE(datum.is_array());
+      trace += "Array = [...]";
+    }
+    return trace;
+  });
+  Datum cond_in;
+  Datum left_in;
+  Datum right_in;
+  int cond_index = 0;
+  int left_index = 0;
+  int right_index = 0;
+  while (NextScalarOrWholeArray(cond, &cond_index, &cond_in)) {
+    SCOPED_TRACE(make_trace("Cond", cond_in, cond_index));
+    while (NextScalarOrWholeArray(left, &left_index, &left_in)) {
+      SCOPED_TRACE(make_trace("Left", left_in, left_index));
+      while (NextScalarOrWholeArray(right, &right_index, &right_in)) {
+        SCOPED_TRACE(make_trace("Right", right_in, right_index));
+        Datum actual;
+        {
+          SCOPED_TRACE(CodedCallName(cond_in, left_in, right_in));
+          ASSERT_OK_AND_ASSIGN(actual, IfElse(cond_in, left_in, right_in));
+        }
+        ASSERT_OK_AND_ASSIGN(
+            auto adjusted_expected,
+            ExpectedFromIfElse(cond_in, left_in, right_in, actual.type(), expected));
+        AssertDatumsEqual(adjusted_expected, actual, /*verbose=*/true);
+      }
+    }
+  }
+}
+
 void CheckWithDifferentShapes(const std::shared_ptr<Array>& cond,
                               const std::shared_ptr<Array>& left,
                               const std::shared_ptr<Array>& right,
                               const std::shared_ptr<Array>& expected) {
-  // this will check for whole arrays, every scalar at i'th index and slicing (offset)
   CheckScalar("if_else", {cond, left, right}, expected);
-
-  auto len = left->length();
-  std::vector<int64_t> array_indices = {-1};  // sentinel for make_input
-  std::vector<int64_t> scalar_indices(len);
-  std::iota(scalar_indices.begin(), scalar_indices.end(), 0);
-  auto make_input = [&](const std::shared_ptr<Array>& array, int64_t index, Datum* input,
-                        Datum* input_broadcast, std::string* trace) {
-    if (index >= 0) {
-      // Use scalar from array[index] as input; broadcast scalar for computing expected
-      // result
-      ASSERT_OK_AND_ASSIGN(auto scalar, array->GetScalar(index));
-      *trace += "@" + std::to_string(index) + "=" + scalar->ToString();
-      *input = std::move(scalar);
-      ASSERT_OK_AND_ASSIGN(*input_broadcast, MakeArrayFromScalar(*input->scalar(), len));
-    } else {
-      // Use array as input
-      *trace += "=Array";
-      *input = *input_broadcast = array;
-    }
-  };
-
-  enum { COND_SCALAR = 1, LEFT_SCALAR = 2, RIGHT_SCALAR = 4 };
-  for (int mask = 1; mask <= (COND_SCALAR | LEFT_SCALAR | RIGHT_SCALAR); ++mask) {
-    for (int64_t cond_idx : (mask & COND_SCALAR) ? scalar_indices : array_indices) {
-      Datum cond_in, cond_bcast;
-      std::string trace_cond = "Cond";
-      make_input(cond, cond_idx, &cond_in, &cond_bcast, &trace_cond);
-
-      for (int64_t left_idx : (mask & LEFT_SCALAR) ? scalar_indices : array_indices) {
-        Datum left_in, left_bcast;
-        std::string trace_left = "Left";
-        make_input(left, left_idx, &left_in, &left_bcast, &trace_left);
-
-        for (int64_t right_idx : (mask & RIGHT_SCALAR) ? scalar_indices : array_indices) {
-          Datum right_in, right_bcast;
-          std::string trace_right = "Right";
-          make_input(right, right_idx, &right_in, &right_bcast, &trace_right);
-
-          SCOPED_TRACE(trace_right);
-          SCOPED_TRACE(trace_left);
-          SCOPED_TRACE(trace_cond);
-
-          Datum expected;
-          ASSERT_OK_AND_ASSIGN(auto actual, IfElse(cond_in, left_in, right_in));
-          if (mask == (COND_SCALAR | LEFT_SCALAR | RIGHT_SCALAR)) {
-            const auto& scalar = cond_in.scalar_as<BooleanScalar>();
-            if (scalar.is_valid) {
-              expected = scalar.value ? left_in : right_in;
-            } else {
-              expected = MakeNullScalar(left_in.type());
-            }
-            if (!left_in.type()->Equals(*right_in.type())) {
-              ASSERT_OK_AND_ASSIGN(expected,
-                                   Cast(expected, CastOptions::Safe(actual.type())));
-            }
-          } else {
-            ASSERT_OK_AND_ASSIGN(expected, IfElse(cond_bcast, left_bcast, right_bcast));
-          }
-          AssertDatumsEqual(expected, actual, /*verbose=*/true);
-        }
-      }
-    }
-  }  // for (mask)
+  DoCheckWithDifferentShapes(cond, left, right, expected);
 }
 
 TYPED_TEST(TestIfElsePrimitive, IfElseFixedSize) {
@@ -450,6 +506,9 @@ TEST_F(TestIfElseKernel, IfElseDispatchBest) {
                     {boolean(), timestamp(TimeUnit::MILLI), timestamp(TimeUnit::MILLI)});
   CheckDispatchBest(name, {boolean(), date32(), timestamp(TimeUnit::MILLI)},
                     {boolean(), timestamp(TimeUnit::MILLI), timestamp(TimeUnit::MILLI)});
+  CheckDispatchBest(name,
+                    {boolean(), duration(TimeUnit::SECOND), duration(TimeUnit::MILLI)},
+                    {boolean(), duration(TimeUnit::MILLI), duration(TimeUnit::MILLI)});
   CheckDispatchBest(name, {boolean(), date32(), date64()},
                     {boolean(), date64(), date64()});
   CheckDispatchBest(name, {boolean(), date32(), date32()},
@@ -678,12 +737,15 @@ TEST_F(TestIfElseKernel, Decimal) {
   }
 }
 
+using ListAndListViewArrowTypes =
+    ::testing::Types<ListType, LargeListType, ListViewType, LargeListViewType>;
+
 template <typename Type>
-class TestIfElseList : public ::testing::Test {};
+class TestIfElseVarLengthListLike : public ::testing::Test {};
 
-TYPED_TEST_SUITE(TestIfElseList, ListArrowTypes);
+TYPED_TEST_SUITE(TestIfElseVarLengthListLike, ListAndListViewArrowTypes);
 
-TYPED_TEST(TestIfElseList, ListOfInt) {
+TYPED_TEST(TestIfElseVarLengthListLike, ListOfInt) {
   auto type = std::make_shared<TypeParam>(int32());
   CheckWithDifferentShapes(ArrayFromJSON(boolean(), "[true, true, false, false]"),
                            ArrayFromJSON(type, "[[], null, [1, null], [2, 3]]"),
@@ -696,7 +758,7 @@ TYPED_TEST(TestIfElseList, ListOfInt) {
                            ArrayFromJSON(type, "[null, null, null, null]"));
 }
 
-TYPED_TEST(TestIfElseList, ListOfString) {
+TYPED_TEST(TestIfElseVarLengthListLike, ListOfString) {
   auto type = std::make_shared<TypeParam>(utf8());
   CheckWithDifferentShapes(
       ArrayFromJSON(boolean(), "[true, true, false, false]"),
@@ -828,8 +890,8 @@ TEST_F(TestIfElseKernel, ParameterizedTypes) {
   EXPECT_RAISES_WITH_MESSAGE_THAT(
       NotImplemented,
       ::testing::HasSubstr("Function 'if_else' has no kernel matching input types "
-                           "(array[bool], array[timestamp[ms, tz=America/New_York]], "
-                           "array[timestamp[s, tz=America/Phoenix]]"),
+                           "(bool, timestamp[ms, tz=America/New_York], "
+                           "timestamp[s, tz=America/Phoenix]"),
       CallFunction("if_else",
                    {cond, ArrayFromJSON(type0, "[0]"), ArrayFromJSON(type1, "[1]")}));
 }
@@ -1018,18 +1080,19 @@ TYPED_TEST(TestIfElseDict, DifferentDictionaries) {
   CheckDictionary("if_else", {MakeNullScalar(boolean()), values1, values2});
 }
 
-template <typename Type>
-class TestCaseWhenNumeric : public ::testing::Test {};
-
-TYPED_TEST_SUITE(TestCaseWhenNumeric, IfElseNumericBasedTypes);
-
 Datum MakeStruct(const std::vector<Datum>& conds) {
-  EXPECT_OK_AND_ASSIGN(auto result, CallFunction("make_struct", conds));
-  return result;
+  if (conds.size() == 0) {
+    // The tests below want a struct scalar when no condition values passed,
+    // not a StructArray of length 0
+    ScalarVector value;
+    return std::make_shared<StructScalar>(value, struct_({}));
+  } else {
+    EXPECT_OK_AND_ASSIGN(Datum result, CallFunction("make_struct", conds));
+    return result;
+  }
 }
 
-TYPED_TEST(TestCaseWhenNumeric, FixedSize) {
-  auto type = default_type_instance<TypeParam>();
+void TestCaseWhenFixedSize(const std::shared_ptr<DataType>& type) {
   auto cond_true = ScalarFromJSON(boolean(), "true");
   auto cond_false = ScalarFromJSON(boolean(), "false");
   auto cond_null = ScalarFromJSON(boolean(), "null");
@@ -1038,7 +1101,7 @@ TYPED_TEST(TestCaseWhenNumeric, FixedSize) {
   auto scalar_null = ScalarFromJSON(type, "null");
   auto values_null = ArrayFromJSON(type, "[null, null, null, null]");
 
-  if (std::is_same<TypeParam, Date64Type>::value) {
+  if (type->id() == Type::DATE64) {
     auto scalar1 = ScalarFromJSON(type, "86400000");
     auto scalar2 = ScalarFromJSON(type, "172800000");
     auto values1 = ArrayFromJSON(type, "[259200000, null, 432000000, 518400000]");
@@ -1128,13 +1191,15 @@ TYPED_TEST(TestCaseWhenNumeric, FixedSize) {
 
     // Error cases
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        Invalid, ::testing::HasSubstr("cond struct must not be null"),
-        CallFunction(
-            "case_when",
-            {Datum(std::make_shared<StructScalar>(struct_({field("", boolean())}))),
-             Datum(scalar1)}));
+        Invalid,
+        ::testing::HasSubstr("cond struct must not be a null scalar or "
+                             "have top-level nulls"),
+        CallFunction("case_when",
+                     {MakeNullScalar(struct_({field("", boolean())})), Datum(scalar1)}));
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        Invalid, ::testing::HasSubstr("cond struct must not have top-level nulls"),
+        Invalid,
+        ::testing::HasSubstr("cond struct must not be a null scalar or "
+                             "have top-level nulls"),
         CallFunction("case_when",
                      {Datum(*MakeArrayOfNull(struct_({field("", boolean())}), 4)),
                       Datum(values1)}));
@@ -1215,17 +1280,84 @@ TYPED_TEST(TestCaseWhenNumeric, FixedSize) {
 
     // Error cases
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        Invalid, ::testing::HasSubstr("cond struct must not be null"),
-        CallFunction(
-            "case_when",
-            {Datum(std::make_shared<StructScalar>(struct_({field("", boolean())}))),
-             Datum(scalar1)}));
+        Invalid,
+        ::testing::HasSubstr("cond struct must not be a null scalar or "
+                             "have top-level nulls"),
+        CallFunction("case_when",
+                     {MakeNullScalar(struct_({field("", boolean())})), Datum(scalar1)}));
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        Invalid, ::testing::HasSubstr("cond struct must not have top-level nulls"),
+        Invalid,
+        ::testing::HasSubstr("cond struct must not be a null scalar or "
+                             "have top-level nulls"),
         CallFunction("case_when",
                      {Datum(*MakeArrayOfNull(struct_({field("", boolean())}), 4)),
                       Datum(values1)}));
   }
+}
+
+void TestCaseWhenRandom(const std::shared_ptr<DataType>& type, int64_t len = 300) {
+  random::RandomArrayGenerator rand(/*seed=*/0);
+
+  // Adding 64 consecutive 1's and 0's in the cond array to test all-true/ all-false
+  // word code paths
+  ASSERT_OK_AND_ASSIGN(auto always_true, MakeArrayFromScalar(BooleanScalar(true), 64));
+  ASSERT_OK_AND_ASSIGN(auto always_false, MakeArrayFromScalar(BooleanScalar(false), 64));
+  auto maybe_true_with_nulls =
+      rand.ArrayOf(boolean(), len - 64 * 2, /*null_probability=*/0.04);
+  auto maybe_true_all_valid =
+      rand.ArrayOf(boolean(), len - 64 * 2, /*null_probability=*/0.0);
+  ASSERT_OK_AND_ASSIGN(auto concat1,
+                       Concatenate({always_true, always_false, maybe_true_with_nulls}));
+  auto cond1 = checked_pointer_cast<BooleanArray>(concat1);
+  ASSERT_OK_AND_ASSIGN(auto concat2,
+                       Concatenate({always_true, maybe_true_all_valid, always_false}));
+  auto cond2 = checked_pointer_cast<BooleanArray>(concat2);
+
+  auto value1 = rand.ArrayOf(type, len, /*null_probability=*/0.04);
+  auto value2 = rand.ArrayOf(type, len, /*null_probability=*/0.04);
+  auto value_else = rand.ArrayOf(type, len, /*null_probability=*/0.04);
+
+  auto value1_span = ArraySpan(*value1->data());
+  auto value2_span = ArraySpan(*value2->data());
+  auto value_else_span = ArraySpan(*value_else->data());
+
+  for (const bool has_else : {true, false}) {
+    ASSERT_OK_AND_ASSIGN(auto builder, MakeBuilder(type));
+    ASSERT_OK(builder->Reserve(len));
+    for (int64_t i = 0; i < len; ++i) {
+      if (cond1->IsValid(i) && cond1->Value(i)) {
+        ASSERT_OK(builder->AppendArraySlice(value1_span, i, /*length=*/1));
+      } else if (cond2->IsValid(i) && cond2->Value(i)) {
+        ASSERT_OK(builder->AppendArraySlice(value2_span, i, /*length=*/1));
+      } else if (has_else) {
+        ASSERT_OK(builder->AppendArraySlice(value_else_span, i, /*length=*/1));
+      } else {
+        ASSERT_OK(builder->AppendNull());
+      }
+    }
+    ASSERT_OK_AND_ASSIGN(auto expected_data, builder->Finish());
+
+    if (has_else) {
+      CheckScalar("case_when", {MakeStruct({cond1, cond2}), value1, value2, value_else},
+                  expected_data);
+    } else {
+      CheckScalar("case_when", {MakeStruct({cond1, cond2}), value1, value2},
+                  expected_data);
+    }
+  }
+}
+
+template <typename Type>
+class TestCaseWhenNumeric : public ::testing::Test {};
+
+TYPED_TEST_SUITE(TestCaseWhenNumeric, IfElseNumericBasedTypes);
+
+TYPED_TEST(TestCaseWhenNumeric, FixedSize) {
+  TestCaseWhenFixedSize(default_type_instance<TypeParam>());
+}
+
+TYPED_TEST(TestCaseWhenNumeric, Random) {
+  TestCaseWhenRandom(default_type_instance<TypeParam>());
 }
 
 TYPED_TEST(TestCaseWhenNumeric, ListOfType) {
@@ -1460,6 +1592,8 @@ TEST(TestCaseWhen, Null) {
   CheckScalar("case_when", {MakeStruct({cond_arr, cond_true}), array, array}, array);
 }
 
+TEST(TestCaseWhen, NullRandom) { TestCaseWhenRandom(null()); }
+
 TEST(TestCaseWhen, Boolean) {
   auto type = boolean();
   auto cond_true = ScalarFromJSON(boolean(), "true");
@@ -1516,6 +1650,8 @@ TEST(TestCaseWhen, Boolean) {
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, "[null, null, null, true]"));
 }
+
+TEST(TestCaseWhen, BooleanRandom) { TestCaseWhenRandom(boolean()); }
 
 TEST(TestCaseWhen, DayTimeInterval) {
   auto type = day_time_interval();
@@ -1574,6 +1710,8 @@ TEST(TestCaseWhen, DayTimeInterval) {
               ArrayFromJSON(type, "[null, null, null, [6, 6]]"));
 }
 
+TEST(TestCaseWhen, DayTimeIntervalRandom) { TestCaseWhenRandom(day_time_interval()); }
+
 TEST(TestCaseWhen, MonthDayNanoInterval) {
   auto type = month_day_nano_interval();
   auto cond1 = ArrayFromJSON(boolean(), "[true, true, null, null]");
@@ -1588,6 +1726,10 @@ TEST(TestCaseWhen, MonthDayNanoInterval) {
               ArrayFromJSON(type, R"([[0, 1, -2], null, null, [-6, -7, -8]])"));
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, R"([null, null, null, [-6, -7, -8]])"));
+}
+
+TEST(TestCaseWhen, MonthDayNanoIntervalRandom) {
+  TestCaseWhenRandom(month_day_nano_interval());
 }
 
 TEST(TestCaseWhen, Decimal) {
@@ -1707,6 +1849,8 @@ TEST(TestCaseWhen, FixedSizeBinary) {
               ArrayFromJSON(type, R"([null, null, null, "efg"])"));
 }
 
+TEST(TestCaseWhen, FixedSizeBinaryRandom) { TestCaseWhenRandom(fixed_size_binary(3)); }
+
 template <typename Type>
 class TestCaseWhenBinary : public ::testing::Test {};
 
@@ -1767,6 +1911,10 @@ TYPED_TEST(TestCaseWhenBinary, Basics) {
               ArrayFromJSON(type, R"(["cDE", null, null, "efg"])"));
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, R"([null, null, null, "efg"])"));
+}
+
+TYPED_TEST(TestCaseWhenBinary, Random) {
+  TestCaseWhenRandom(default_type_instance<TypeParam>());
 }
 
 template <typename Type>
@@ -1834,6 +1982,11 @@ TYPED_TEST(TestCaseWhenList, ListOfString) {
               ArrayFromJSON(type, R"([null, null, null, ["ef", "g"]])"));
 }
 
+TYPED_TEST(TestCaseWhenList, ListOfStringRandom) {
+  auto type = std::make_shared<TypeParam>(utf8());
+  TestCaseWhenRandom(type, /*len=*/200);
+}
+
 // More minimal tests to check type coverage
 TYPED_TEST(TestCaseWhenList, ListOfBool) {
   auto type = std::make_shared<TypeParam>(boolean());
@@ -1849,6 +2002,11 @@ TYPED_TEST(TestCaseWhenList, ListOfBool) {
               ArrayFromJSON(type, R"([[true], null, null, [false, null]])"));
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, R"([null, null, null, [false, null]])"));
+}
+
+TYPED_TEST(TestCaseWhenList, ListOfBoolRandom) {
+  auto type = std::make_shared<TypeParam>(boolean());
+  TestCaseWhenRandom(type, /*len=*/200);
 }
 
 TYPED_TEST(TestCaseWhenList, ListOfInt) {
@@ -1938,6 +2096,11 @@ TYPED_TEST(TestCaseWhenList, ListOfListOfInt) {
               ArrayFromJSON(type, R"([[[1, 2], []], null, null, [[6, null], null]])"));
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, R"([null, null, null, [[6, null], null]])"));
+}
+
+TYPED_TEST(TestCaseWhenList, ListOfListOfIntRandom) {
+  auto type = std::make_shared<TypeParam>(list(int64()));
+  TestCaseWhenRandom(type, /*len=*/200);
 }
 
 TEST(TestCaseWhen, Map) {
@@ -2063,6 +2226,11 @@ TEST(TestCaseWhen, FixedSizeListOfInt) {
               ArrayFromJSON(type, R"([null, null, null, [8, 9]])"));
 }
 
+TEST(TestCaseWhen, FixedSizeListOfIntRandom) {
+  auto type = fixed_size_list(int64(), 2);
+  TestCaseWhenRandom(type);
+}
+
 TEST(TestCaseWhen, FixedSizeListOfString) {
   auto type = fixed_size_list(utf8(), 2);
   auto cond_true = ScalarFromJSON(boolean(), "true");
@@ -2181,6 +2349,11 @@ TEST(TestCaseWhen, StructOfInt) {
               ArrayFromJSON(type, R"([null, null, null, [7, -8]])"));
 }
 
+TEST(TestCaseWhen, StructOfIntRandom) {
+  auto type = struct_({field("a", uint32()), field("b", int64())});
+  TestCaseWhenRandom(type);
+}
+
 TEST(TestCaseWhen, StructOfString) {
   // More minimal test to check type coverage
   auto type = struct_({field("a", utf8()), field("b", large_utf8())});
@@ -2209,6 +2382,11 @@ TEST(TestCaseWhen, StructOfString) {
               ArrayFromJSON(type, R"([["efg", null], null, null, [null, "hi"]])"));
   CheckScalar("case_when", {MakeStruct({cond1, cond2}), values_null, values2, values1},
               ArrayFromJSON(type, R"([null, null, null, [null, "hi"]])"));
+}
+
+TEST(TestCaseWhen, StructOfStringRandom) {
+  auto type = struct_({field("a", utf8()), field("b", large_utf8())});
+  TestCaseWhenRandom(type);
 }
 
 TEST(TestCaseWhen, StructOfListOfInt) {
@@ -2307,6 +2485,15 @@ TEST(TestCaseWhen, UnionBoolString) {
   }
 }
 
+TEST(TestCaseWhen, UnionBoolStringRandom) {
+  for (const auto& type : std::vector<std::shared_ptr<DataType>>{
+           sparse_union({field("a", boolean()), field("b", utf8())}, {2, 7}),
+           dense_union({field("a", boolean()), field("b", utf8())}, {2, 7})}) {
+    ARROW_SCOPED_TRACE(type->ToString());
+    TestCaseWhenRandom(type);
+  }
+}
+
 TEST(TestCaseWhen, DispatchBest) {
   CheckDispatchBest("case_when", {struct_({field("", boolean())}), int64(), int32()},
                     {struct_({field("", boolean())}), int64(), int64()});
@@ -2318,11 +2505,16 @@ TEST(TestCaseWhen, DispatchBest) {
       {struct_({field("", boolean())}), timestamp(TimeUnit::SECOND), date32()},
       {struct_({field("", boolean())}), timestamp(TimeUnit::SECOND),
        timestamp(TimeUnit::SECOND)});
+  CheckDispatchBest("case_when",
+                    {struct_({field("", boolean())}), duration(TimeUnit::SECOND),
+                     duration(TimeUnit::MILLI)},
+                    {struct_({field("", boolean())}), duration(TimeUnit::MILLI),
+                     duration(TimeUnit::MILLI)});
   CheckDispatchBest(
       "case_when", {struct_({field("", boolean())}), decimal128(38, 0), decimal128(1, 1)},
       {struct_({field("", boolean())}), decimal256(39, 1), decimal256(39, 1)});
 
-  ASSERT_RAISES(Invalid, CallFunction("case_when", {}));
+  ASSERT_RAISES(Invalid, CallFunction("case_when", ExecBatch({}, 0)));
   // Too many/too few conditions
   ASSERT_RAISES(
       Invalid, CallFunction("case_when", {MakeStruct({ArrayFromJSON(boolean(), "[]")})}));
@@ -3168,6 +3360,8 @@ TEST(TestCoalesce, DispatchBest) {
                     {timestamp(TimeUnit::SECOND), timestamp(TimeUnit::SECOND)});
   CheckDispatchBest("coalesce", {timestamp(TimeUnit::SECOND), timestamp(TimeUnit::MILLI)},
                     {timestamp(TimeUnit::MILLI), timestamp(TimeUnit::MILLI)});
+  CheckDispatchBest("coalesce", {duration(TimeUnit::SECOND), duration(TimeUnit::MILLI)},
+                    {duration(TimeUnit::MILLI), duration(TimeUnit::MILLI)});
   CheckDispatchFails("coalesce", {
                                      sparse_union({field("a", boolean())}),
                                      dense_union({field("a", boolean())}),
@@ -3389,7 +3583,7 @@ TEST(TestChoose, FixedSizeBinary) {
 
 TEST(TestChooseKernel, DispatchBest) {
   ASSERT_OK_AND_ASSIGN(auto function, GetFunctionRegistry()->GetFunction("choose"));
-  auto Check = [&](std::vector<ValueDescr> original_values) {
+  auto Check = [&](std::vector<TypeHolder> original_values) {
     auto values = original_values;
     ARROW_EXPECT_OK(function->DispatchBest(&values));
     return values;
@@ -3400,17 +3594,17 @@ TEST(TestChooseKernel, DispatchBest) {
   for (auto ty :
        {int8(), int16(), int32(), int64(), uint8(), uint16(), uint32(), uint64()}) {
     // Index always promoted to int64
-    EXPECT_EQ((std::vector<ValueDescr>{int64(), ty}), Check({ty, ty}));
-    EXPECT_EQ((std::vector<ValueDescr>{int64(), int64(), int64()}),
+    EXPECT_EQ((std::vector<TypeHolder>{int64(), ty}), Check({ty, ty}));
+    EXPECT_EQ((std::vector<TypeHolder>{int64(), int64(), int64()}),
               Check({ty, ty, int64()}));
   }
   // Other arguments promoted separately from index
-  EXPECT_EQ((std::vector<ValueDescr>{int64(), int32(), int32()}),
+  EXPECT_EQ((std::vector<TypeHolder>{int64(), int32(), int32()}),
             Check({int8(), int32(), uint8()}));
 }
 
 TEST(TestChooseKernel, Errors) {
-  ASSERT_RAISES(Invalid, CallFunction("choose", {}));
+  ASSERT_RAISES(Invalid, CallFunction("choose", ExecBatch({}, 0)));
   ASSERT_RAISES(Invalid, CallFunction("choose", {ArrayFromJSON(int64(), "[]")}));
   ASSERT_RAISES(Invalid, CallFunction("choose", {ArrayFromJSON(utf8(), "[\"a\"]"),
                                                  ArrayFromJSON(int64(), "[0]")}));

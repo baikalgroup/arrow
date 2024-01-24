@@ -65,8 +65,8 @@ TEST_F(TestChunkedArray, Make) {
   ASSERT_OK_AND_ASSIGN(auto result2, ChunkedArray::Make({chunk0, chunk0}, int8()));
   AssertChunkedEqual(*result, *result2);
 
-  ASSERT_RAISES(Invalid, ChunkedArray::Make({chunk0, chunk1}));
-  ASSERT_RAISES(Invalid, ChunkedArray::Make({chunk0}, int16()));
+  ASSERT_RAISES(TypeError, ChunkedArray::Make({chunk0, chunk1}));
+  ASSERT_RAISES(TypeError, ChunkedArray::Make({chunk0}, int16()));
 }
 
 TEST_F(TestChunkedArray, MakeEmpty) {
@@ -146,6 +146,35 @@ TEST_F(TestChunkedArray, EqualsDifferingMetadata) {
   ASSERT_TRUE(left.Equals(right));
 }
 
+TEST_F(TestChunkedArray, EqualsSameAddressWithNaNs) {
+  auto chunk_with_nan1 = ArrayFromJSON(float64(), "[0, 1, 2, NaN]");
+  auto chunk_without_nan1 = ArrayFromJSON(float64(), "[3, 4, 5]");
+  ArrayVector chunks1 = {chunk_with_nan1, chunk_without_nan1};
+  ASSERT_OK_AND_ASSIGN(auto chunked_array_with_nan1, ChunkedArray::Make(chunks1));
+  ASSERT_FALSE(chunked_array_with_nan1->Equals(chunked_array_with_nan1));
+
+  auto chunk_without_nan2 = ArrayFromJSON(float64(), "[6, 7, 8, 9]");
+  ArrayVector chunks2 = {chunk_without_nan1, chunk_without_nan2};
+  ASSERT_OK_AND_ASSIGN(auto chunked_array_without_nan1, ChunkedArray::Make(chunks2));
+  ASSERT_TRUE(chunked_array_without_nan1->Equals(chunked_array_without_nan1));
+
+  auto int32_array = ArrayFromJSON(int32(), "[0, 1, 2]");
+  auto float64_array_with_nan = ArrayFromJSON(float64(), "[0, 1, NaN]");
+  ArrayVector arrays1 = {int32_array, float64_array_with_nan};
+  std::vector<std::string> fieldnames = {"Int32Type", "Float64Type"};
+  ASSERT_OK_AND_ASSIGN(auto struct_with_nan, StructArray::Make(arrays1, fieldnames));
+  ArrayVector chunks3 = {struct_with_nan};
+  ASSERT_OK_AND_ASSIGN(auto chunked_array_with_nan2, ChunkedArray::Make(chunks3));
+  ASSERT_FALSE(chunked_array_with_nan2->Equals(chunked_array_with_nan2));
+
+  auto float64_array_without_nan = ArrayFromJSON(float64(), "[0, 1, 2]");
+  ArrayVector arrays2 = {int32_array, float64_array_without_nan};
+  ASSERT_OK_AND_ASSIGN(auto struct_without_nan, StructArray::Make(arrays2, fieldnames));
+  ArrayVector chunks4 = {struct_without_nan};
+  ASSERT_OK_AND_ASSIGN(auto chunked_array_without_nan2, ChunkedArray::Make(chunks4));
+  ASSERT_TRUE(chunked_array_without_nan2->Equals(chunked_array_without_nan2));
+}
+
 TEST_F(TestChunkedArray, SliceEquals) {
   random::RandomArrayGenerator gen(42);
 
@@ -199,7 +228,7 @@ TEST_F(TestChunkedArray, Validate) {
 
   random::RandomArrayGenerator gen(0);
 
-  // Valid if non-empty and ommitted type
+  // Valid if non-empty and omitted type
   ArrayVector arrays = {gen.Int64(50, 0, 100, 0.1), gen.Int64(50, 0, 100, 0.1)};
   auto chunks_with_no_type = std::make_shared<ChunkedArray>(arrays, nullptr);
   ASSERT_OK(chunks_with_no_type->ValidateFull());
@@ -278,7 +307,7 @@ TEST_F(TestChunkedArray, GetScalar) {
   check_scalar(carr, 4, **MakeScalar(ty, 3));
   check_scalar(carr, 6, **MakeScalar(ty, 5));
 
-  ASSERT_RAISES(Invalid, carr.GetScalar(7));
+  ASSERT_RAISES(IndexError, carr.GetScalar(7));
 }
 
 }  // namespace arrow

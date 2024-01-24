@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { metadataFiles, packageJSONFields, mainExport, npmPkgName, npmOrgName, targetDir, packageName, observableFromStreams } from "./util.js";
+import { metadataFiles, packageJSONFields, mainExport, npmPkgName, npmOrgName, targetDir, packageName, observableFromStreams } from './util.js';
 
-import gulp from "gulp";
-import { memoizeTask } from "./memoize-task.js";
-import { ReplaySubject, EMPTY as ObservableEmpty, forkJoin as ObservableForkJoin } from "rxjs";
-import { share } from "rxjs/operators";
-import gulpJsonTransform from "gulp-json-transform";
+import gulp from 'gulp';
+import { memoizeTask } from './memoize-task.js';
+import { ReplaySubject, EMPTY as ObservableEmpty, forkJoin as ObservableForkJoin } from 'rxjs';
+import { share } from 'rxjs/operators';
+import gulpJsonTransform from 'gulp-json-transform';
 
 export const packageTask = ((cache) => memoizeTask(cache, function bundle(target, format) {
     if (target === `src`) return ObservableEmpty();
@@ -45,27 +45,45 @@ const createMainPackageJson = (target, format) => (orig) => ({
     type: 'commonjs',
     main: `${mainExport}.node.js`,
     module: `${mainExport}.node.mjs`,
+    types: `${mainExport}.node.d.ts`,
+    unpkg: `${mainExport}.es2015.min.js`,
+    jsdelivr: `${mainExport}.es2015.min.js`,
     browser: {
         [`./${mainExport}.node.js`]: `./${mainExport}.dom.js`,
         [`./${mainExport}.node.mjs`]: `./${mainExport}.dom.mjs`
     },
     exports: {
-        ".": {
+        '.': {
             node: {
-                import: `./${mainExport}.node.mjs`,
-                require: `./${mainExport}.node.js`,
+                import: {
+                    types: `./${mainExport}.node.d.mts`,
+                    default: `./${mainExport}.node.mjs`,
+                },
+                require: {
+                    types: `./${mainExport}.node.d.ts`,
+                    default: `./${mainExport}.node.js`,
+                },
             },
-            import: `./${mainExport}.dom.mjs`,
-            require: `./${mainExport}.dom.js`,
+            import: {
+                types: `./${mainExport}.dom.d.mts`,
+                default: `./${mainExport}.dom.mjs`,
+            },
+            require: {
+                types: `./${mainExport}.dom.d.ts`,
+                default: `./${mainExport}.dom.js`,
+            }
         },
-        "./*": {
-            import: `./*.mjs`,
-            require: `./*.js`
-        }
+        './*': {
+            import: {
+                types: `./*.d.mts`,
+                default: `./*.mjs`,
+            },
+            require: {
+                types: `./*.d.ts`,
+                default: `./*.js`,
+            },
+        },
     },
-    types: `${mainExport}.node.d.ts`,
-    unpkg: `${mainExport}.es2015.min.js`,
-    jsdelivr: `${mainExport}.es2015.min.js`,
     sideEffects: false,
     esm: { mode: `all`, sourceMap: true }
 });
@@ -77,11 +95,10 @@ const createTypeScriptPackageJson = (target, format) => (orig) => ({
     module: `${mainExport}.node.ts`,
     types: `${mainExport}.node.ts`,
     browser: `${mainExport}.dom.ts`,
-    type: "module",
+    type: 'module',
     sideEffects: false,
     esm: { mode: `auto`, sourceMap: true },
     dependencies: {
-        '@types/flatbuffers': '*',
         '@types/node': '*',
         ...orig.dependencies
     }

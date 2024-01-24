@@ -19,15 +19,14 @@ package arrio_test
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/arrio"
-	"github.com/apache/arrow/go/v8/arrow/internal/arrdata"
-	"github.com/apache/arrow/go/v8/arrow/ipc"
-	"github.com/apache/arrow/go/v8/arrow/memory"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/arrio"
+	"github.com/apache/arrow/go/v15/arrow/internal/arrdata"
+	"github.com/apache/arrow/go/v15/arrow/ipc"
+	"github.com/apache/arrow/go/v15/arrow/memory"
 )
 
 type copyKind int
@@ -64,11 +63,7 @@ func (k copyKind) check(t *testing.T, f *os.File, mem memory.Allocator, schema *
 }
 
 func TestCopy(t *testing.T) {
-	tempDir, err := ioutil.TempDir("", "go-arrow-copy-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := t.TempDir()
 
 	for _, tc := range []struct {
 		name     string
@@ -97,13 +92,13 @@ func TestCopy(t *testing.T) {
 							mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
 							defer mem.AssertSize(t, 0)
 
-							f, err := ioutil.TempFile(tempDir, "go-arrow-copy-")
+							f, err := os.CreateTemp(tempDir, "go-arrow-copy-")
 							if err != nil {
 								t.Fatal(err)
 							}
 							defer f.Close()
 
-							o, err := ioutil.TempFile(tempDir, "go-arrow-copy-")
+							o, err := os.CreateTemp(tempDir, "go-arrow-copy-")
 							if err != nil {
 								t.Fatal(err)
 							}

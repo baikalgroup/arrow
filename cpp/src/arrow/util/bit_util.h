@@ -335,7 +335,9 @@ void ClearBitmap(uint8_t* data, int64_t offset, int64_t length);
 /// ref: https://stackoverflow.com/a/59523400
 template <typename Word>
 constexpr Word PrecedingWordBitmask(unsigned int const i) {
-  return (static_cast<Word>(i < sizeof(Word) * 8) << (i & (sizeof(Word) * 8 - 1))) - 1;
+  return static_cast<Word>(static_cast<Word>(i < sizeof(Word) * 8)
+                           << (i & (sizeof(Word) * 8 - 1))) -
+         1;
 }
 static_assert(PrecedingWordBitmask<uint8_t>(0) == 0x00, "");
 static_assert(PrecedingWordBitmask<uint8_t>(4) == 0x0f, "");
@@ -351,6 +353,17 @@ static_assert(PrecedingWordBitmask<uint16_t>(8) == 0x00ff, "");
 template <typename Word>
 constexpr Word SpliceWord(int n, Word low, Word high) {
   return (high & ~PrecedingWordBitmask<Word>(n)) | (low & PrecedingWordBitmask<Word>(n));
+}
+
+/// \brief Pack integers into a bitmap in batches of 8
+template <int batch_size>
+void PackBits(const uint32_t* values, uint8_t* out) {
+  for (int i = 0; i < batch_size / 8; ++i) {
+    *out++ = static_cast<uint8_t>(values[0] | values[1] << 1 | values[2] << 2 |
+                                  values[3] << 3 | values[4] << 4 | values[5] << 5 |
+                                  values[6] << 6 | values[7] << 7);
+    values += 8;
+  }
 }
 
 }  // namespace bit_util

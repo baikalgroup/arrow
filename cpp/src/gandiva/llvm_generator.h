@@ -18,7 +18,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,17 +49,17 @@ class FunctionHolder;
 class GANDIVA_EXPORT LLVMGenerator {
  public:
   /// \brief Factory method to initialize the generator.
-  static Status Make(std::shared_ptr<Configuration> config,
-                     std::unique_ptr<LLVMGenerator>* llvm_generator);
+  static Result<std::unique_ptr<LLVMGenerator>> Make(
+      const std::shared_ptr<Configuration>& config, bool cached,
+      std::optional<std::reference_wrapper<GandivaObjectCache>> object_cache =
+          std::nullopt);
 
-#ifdef GANDIVA_ENABLE_OBJECT_CODE_CACHE
   /// \brief Get the cache to be used for LLVM ObjectCache.
   static std::shared_ptr<Cache<ExpressionCacheKey, std::shared_ptr<llvm::MemoryBuffer>>>
   GetCache();
 
   /// \brief Set LLVM ObjectCache.
-  void SetLLVMObjectCache(GandivaObjectCache& object_cache);
-#endif
+  Status SetLLVMObjectCache(GandivaObjectCache& object_cache);
 
   /// \brief Build the code for the expression trees for default mode with a LLVM
   /// ObjectCache. Each element in the vector represents an expression tree
@@ -70,25 +72,27 @@ class GANDIVA_EXPORT LLVMGenerator {
   /// \brief Execute the built expression against the provided arguments for
   /// default mode.
   Status Execute(const arrow::RecordBatch& record_batch,
-                 const ArrayDataVector& output_vector);
+                 const ArrayDataVector& output_vector) const;
 
   /// \brief Execute the built expression against the provided arguments for
   /// all modes. Only works on the records specified in the selection_vector.
   Status Execute(const arrow::RecordBatch& record_batch,
                  const SelectionVector* selection_vector,
-                 const ArrayDataVector& output_vector);
+                 const ArrayDataVector& output_vector) const;
 
   SelectionVector::Mode selection_vector_mode() { return selection_vector_mode_; }
   LLVMTypes* types() { return engine_->types(); }
   llvm::Module* module() { return engine_->module(); }
-  std::string DumpIR() { return engine_->DumpIR(); }
+  const std::string& ir() { return engine_->ir(); }
 
  private:
-  LLVMGenerator();
+  explicit LLVMGenerator(bool cached,
+                         std::shared_ptr<FunctionRegistry> function_registry);
 
   FRIEND_TEST(TestLLVMGenerator, VerifyPCFunctions);
   FRIEND_TEST(TestLLVMGenerator, TestAdd);
   FRIEND_TEST(TestLLVMGenerator, TestNullInternal);
+  friend class TestLLVMGenerator;
 
   llvm::LLVMContext* context() { return engine_->context(); }
   llvm::IRBuilder<>* ir_builder() { return engine_->ir_builder(); }
@@ -146,7 +150,7 @@ class GANDIVA_EXPORT LLVMGenerator {
                                           const ValueValidityPairVector& args,
                                           bool with_validity, bool with_context);
 
-    // Generate code to onvoke a function call.
+    // Generate code to invoke a function call.
     LValuePtr BuildFunctionCall(const NativeFunction* func, DataTypePtr arrow_return_type,
                                 std::vector<llvm::Value*>* params);
 
@@ -185,7 +189,7 @@ class GANDIVA_EXPORT LLVMGenerator {
   Status Add(const ExpressionPtr expr, const FieldDescriptorPtr output);
 
   /// Generate code to load the vector at specified index in the 'arg_addrs' array.
-  llvm::Value* LoadVectorAtIndex(llvm::Value* arg_addrs, int idx,
+  llvm::Value* LoadVectorAtIndex(llvm::Value* arg_addrs, llvm::Type* type, int idx,
                                  const std::string& name);
 
   /// Generate code to load the vector at specified index and cast it as bitmap.
@@ -202,7 +206,7 @@ class GANDIVA_EXPORT LLVMGenerator {
 
   /// Generate code for the value array of one expression.
   Status CodeGenExprValue(DexPtr value_expr, int num_buffers, FieldDescriptorPtr output,
-                          int suffix_idx, llvm::Function** fn,
+                          int suffix_idx, std::string& fn_name,
                           SelectionVector::Mode selection_vector_mode);
 
   /// Generate code to load the local bitmap specified index and cast it as bitmap.
@@ -235,11 +239,11 @@ class GANDIVA_EXPORT LLVMGenerator {
   ///
   /// \param[in] compiled_expr the compiled expression (includes the bitmap indices to be
   ///            used for computing the validity bitmap of the result).
-  /// \param[in] eval_batch (includes input/output buffer addresses)
   /// \param[in] selection_vector the list of selected positions
+  /// \param[in,out] eval_batch (includes input/output buffer addresses)
   void ComputeBitMapsForExpr(const CompiledExpr& compiled_expr,
-                             const EvalBatch& eval_batch,
-                             const SelectionVector* selection_vector);
+                             const SelectionVector* selection_vector,
+                             EvalBatch* eval_batch) const;
 
   /// Replace the %T in the trace msg with the correct type corresponding to 'type'
   /// eg. %d for int32, %ld for int64, ..
@@ -251,7 +255,8 @@ class GANDIVA_EXPORT LLVMGenerator {
 
   std::unique_ptr<Engine> engine_;
   std::vector<std::unique_ptr<CompiledExpr>> compiled_exprs_;
-  FunctionRegistry function_registry_;
+  bool cached_;
+  std::shared_ptr<FunctionRegistry> function_registry_;
   Annotator annotator_;
   SelectionVector::Mode selection_vector_mode_;
 

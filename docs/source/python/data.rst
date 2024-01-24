@@ -216,7 +216,7 @@ value during the conversion. If an integer input is supplied to
 
 To handle better compatibility with Pandas, we support interpreting NaN values as
 null elements. This is enabled automatically on all ``from_pandas`` function and
-can be enable on the other conversion functions by passing ``from_pandas=True``
+can be enabled on the other conversion functions by passing ``from_pandas=True``
 as a function parameter.
 
 List arrays
@@ -510,5 +510,29 @@ a new schema and cast the data to this schema:
    t2.schema.field("f1").metadata
    t2.schema.metadata
 
-Metadata key and value pair are ``std::string`` objects in the C++ implementation
+Metadata key and value pairs are ``std::string`` objects in the C++ implementation
 and so they are bytes objects (``b'...'``) in Python.
+
+Record Batch Readers
+--------------------
+
+Many functions in PyArrow either return or take as an argument a :class:`RecordBatchReader`.
+It can be used like any iterable of record batches, but also provides their common
+schema without having to get any of the batches.::
+
+   >>> schema = pa.schema([('x', pa.int64())])
+   >>> def iter_record_batches():
+   ...    for i in range(2):
+   ...       yield pa.RecordBatch.from_arrays([pa.array([1, 2, 3])], schema=schema)
+   >>> reader = pa.RecordBatchReader.from_batches(schema, iter_record_batches())
+   >>> print(reader.schema)
+   pyarrow.Schema
+   x: int64
+   >>> for batch in reader:
+   ...    print(batch)
+   pyarrow.RecordBatch
+   x: int64
+   pyarrow.RecordBatch
+   x: int64
+
+It can also be sent between languages using the :ref:`C stream interface <c-stream-interface>`.

@@ -25,7 +25,7 @@
 #include "arrow/dataset/discovery.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/dataset/partition.h"
-#include "arrow/dataset/test_util.h"
+#include "arrow/dataset/test_util_internal.h"
 #include "arrow/io/memory.h"
 #include "arrow/ipc/reader.h"
 #include "arrow/ipc/writer.h"
@@ -47,8 +47,7 @@ class IpcFormatHelper {
   static Result<std::shared_ptr<Buffer>> Write(RecordBatchReader* reader) {
     ARROW_ASSIGN_OR_RAISE(auto sink, io::BufferOutputStream::Create());
     ARROW_ASSIGN_OR_RAISE(auto writer, ipc::MakeFileWriter(sink, reader->schema()));
-    std::vector<std::shared_ptr<RecordBatch>> batches;
-    RETURN_NOT_OK(reader->ReadAll(&batches));
+    ARROW_ASSIGN_OR_RAISE(auto batches, reader->ToRecordBatches());
     for (auto batch : batches) {
       RETURN_NOT_OK(writer->WriteRecordBatch(*batch));
     }
@@ -90,6 +89,7 @@ TEST_F(TestIpcFileFormat, InspectFailureWithRelevantError) {
 TEST_F(TestIpcFileFormat, Inspect) { TestInspect(); }
 TEST_F(TestIpcFileFormat, IsSupported) { TestIsSupported(); }
 TEST_F(TestIpcFileFormat, CountRows) { TestCountRows(); }
+TEST_F(TestIpcFileFormat, FragmentEquals) { TestFragmentEquals(); }
 
 class TestIpcFileSystemDataset : public testing::Test,
                                  public WriteFileSystemDatasetMixin {
@@ -135,6 +135,7 @@ class TestIpcFileFormatScan : public FileFormatScanMixin<IpcFormatHelper> {};
 
 TEST_P(TestIpcFileFormatScan, ScanRecordBatchReader) { TestScan(); }
 TEST_P(TestIpcFileFormatScan, ScanBatchSize) { TestScanBatchSize(); }
+TEST_P(TestIpcFileFormatScan, ScanNoReadahead) { TestScanNoReadahead(); }
 TEST_P(TestIpcFileFormatScan, ScanRecordBatchReaderProjected) { TestScanProjected(); }
 TEST_P(TestIpcFileFormatScan, ScanRecordBatchReaderProjectedNested) {
   TestScanProjectedNested();
@@ -151,6 +152,7 @@ TEST_P(TestIpcFileFormatScan, ScanRecordBatchReaderWithDuplicateColumn) {
 TEST_P(TestIpcFileFormatScan, ScanRecordBatchReaderWithDuplicateColumnError) {
   TestScanWithDuplicateColumnError();
 }
+TEST_P(TestIpcFileFormatScan, ScanWithPushdownNulls) { TestScanWithPushdownNulls(); }
 TEST_P(TestIpcFileFormatScan, FragmentScanOptions) {
   auto reader = GetRecordBatchReader(
       // ARROW-12077: on Windows/mimalloc/release, nullable list column leads to crash

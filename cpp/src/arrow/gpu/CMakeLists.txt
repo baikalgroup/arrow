@@ -29,17 +29,20 @@ if(DEFINED ENV{CUDA_HOME})
   set(CUDA_TOOLKIT_ROOT_DIR "$ENV{CUDA_HOME}")
 endif()
 
+set(ARROW_CUDA_LINK_LIBS arrow::flatbuffers)
 if(CMAKE_VERSION VERSION_LESS 3.17)
   find_package(CUDA REQUIRED)
-  set(ARROW_CUDA_SHARED_LINK_LIBS ${CUDA_CUDA_LIBRARY})
-  include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
+  add_library(ArrowCUDA::cuda_driver SHARED IMPORTED)
+  set_target_properties(ArrowCUDA::cuda_driver
+                        PROPERTIES IMPORTED_LOCATION "${CUDA_CUDA_LIBRARY}"
+                                   INTERFACE_INCLUDE_DIRECTORIES "${CUDA_INCLUDE_DIRS}")
+  set(ARROW_CUDA_SHARED_LINK_LIBS ArrowCUDA::cuda_driver)
 else()
   # find_package(CUDA) is deprecated, and for newer CUDA, it doesn't
   # recognize that the CUDA driver library is in the "stubs" dir, but
   # CUDAToolkit is only available in CMake >= 3.17
   find_package(CUDAToolkit REQUIRED)
   set(ARROW_CUDA_SHARED_LINK_LIBS CUDA::cuda_driver)
-  include_directories(SYSTEM ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
 set(ARROW_CUDA_SRCS cuda_arrow_ipc.cc cuda_context.cc cuda_internal.cc cuda_memory.cc)
@@ -57,9 +60,17 @@ add_arrow_lib(arrow_cuda
               ${ARROW_VERSION_SCRIPT_FLAGS} # Defined in cpp/arrow/CMakeLists.txt
               SHARED_LINK_LIBS
               arrow_shared
+              ${ARROW_CUDA_LINK_LIBS}
+              ${ARROW_CUDA_SHARED_LINK_LIBS}
+              SHARED_INSTALL_INTERFACE_LIBS
+              Arrow::arrow_shared
               ${ARROW_CUDA_SHARED_LINK_LIBS}
               # Static arrow_cuda must also link against CUDA shared libs
               STATIC_LINK_LIBS
+              ${ARROW_CUDA_LINK_LIBS}
+              ${ARROW_CUDA_SHARED_LINK_LIBS}
+              STATIC_INSTALL_INTERFACE_LIBS
+              Arrow::arrow_static
               ${ARROW_CUDA_SHARED_LINK_LIBS})
 
 add_dependencies(arrow_cuda ${ARROW_CUDA_LIBRARIES})
@@ -89,9 +100,10 @@ if(ARROW_BUILD_TESTS)
 endif()
 
 if(ARROW_BUILD_BENCHMARKS)
-  add_arrow_benchmark(cuda_benchmark PREFIX "arrow-gpu")
-  target_link_libraries(arrow-gpu-cuda-benchmark
-                        PUBLIC ${ARROW_CUDA_LIBRARY} GTest::gtest
-                               ${ARROW_BENCHMARK_LINK_LIBS})
+  add_arrow_benchmark(cuda_benchmark
+                      PREFIX
+                      "arrow-gpu"
+                      EXTRA_LINK_LIBS
+                      ${ARROW_CUDA_LIBRARY})
   add_dependencies(arrow_cuda-benchmarks arrow-gpu-cuda-benchmark)
 endif()

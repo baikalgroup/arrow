@@ -17,10 +17,11 @@
 package arrow_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/apache/arrow/go/v8/arrow"
+	"github.com/apache/arrow/go/v15/arrow"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -59,6 +60,33 @@ func TestDecimal128Type(t *testing.T) {
 			}
 
 			if got, want := dt.ID(), arrow.DECIMAL128; got != want {
+				t.Fatalf("invalid type ID: got=%v, want=%v", got, want)
+			}
+
+			if got, want := dt.String(), tc.want; got != want {
+				t.Fatalf("invalid stringer: got=%q, want=%q", got, want)
+			}
+		})
+	}
+}
+
+func TestDecimal256Type(t *testing.T) {
+	for _, tc := range []struct {
+		precision int32
+		scale     int32
+		want      string
+	}{
+		{1, 10, "decimal256(1, 10)"},
+		{10, 10, "decimal256(10, 10)"},
+		{10, 1, "decimal256(10, 1)"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			dt := arrow.Decimal256Type{Precision: tc.precision, Scale: tc.scale}
+			if got, want := dt.BitWidth(), 256; got != want {
+				t.Fatalf("invalid bitwidth: got=%d, want=%d", got, want)
+			}
+
+			if got, want := dt.ID(), arrow.DECIMAL256; got != want {
 				t.Fatalf("invalid type ID: got=%v, want=%v", got, want)
 			}
 
@@ -112,7 +140,7 @@ func TestTimestampType(t *testing.T) {
 		{arrow.Second, "", "timestamp[s]"},
 	} {
 		t.Run(tc.want, func(t *testing.T) {
-			dt := arrow.TimestampType{tc.unit, tc.timeZone}
+			dt := arrow.TimestampType{Unit: tc.unit, TimeZone: tc.timeZone}
 			if got, want := dt.BitWidth(), 64; got != want {
 				t.Fatalf("invalid bitwidth: got=%d, want=%d", got, want)
 			}
@@ -130,6 +158,51 @@ func TestTimestampType(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTimestampToTime(t *testing.T) {
+	ts := arrow.Timestamp(11865225600000)
+	tm := ts.ToTime(arrow.Millisecond)
+
+	assert.Equal(t, "2345-12-30 00:00:00", tm.Format("2006-01-02 15:04:05.999"))
+}
+
+func TestTimestampType_GetToTimeFunc(t *testing.T) {
+	typUTC := &arrow.TimestampType{Unit: arrow.Millisecond}
+	toTimeUTC, err := typUTC.GetToTimeFunc()
+	assert.NoError(t, err)
+
+	typNY := &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "America/New_York"}
+	toTimeNY, err := typNY.GetToTimeFunc()
+	assert.NoError(t, err)
+
+	ts := arrow.Timestamp(11865225600000)
+	assert.Equal(t, "2345-12-30T00:00:00Z", toTimeUTC(ts).Format(time.RFC3339))
+	assert.Equal(t, "2345-12-29T19:00:00-05:00", toTimeNY(ts).Format(time.RFC3339))
+}
+
+// Test race condition from GH-38795
+func TestGetToTimeFuncRace(t *testing.T) {
+	var (
+		wg         sync.WaitGroup
+		w          = make(chan bool)
+		routineNum = 10
+	)
+
+	wg.Add(routineNum)
+	for i := 0; i < routineNum; i++ {
+		go func() {
+			defer wg.Done()
+
+			<-w
+
+			_, _ = arrow.FixedWidthTypes.Timestamp_s.(*arrow.TimestampType).GetToTimeFunc()
+		}()
+	}
+
+	close(w)
+
+	wg.Wait()
 }
 
 func TestTime32Type(t *testing.T) {
@@ -235,7 +308,7 @@ func TestTime64Type(t *testing.T) {
 		{arrow.Microsecond, "22:10:15.123456", arrow.Time64((22*h + 10*m + 15*s + 123456*us).Microseconds()), false},
 		{arrow.Microsecond, "12:34:56.78901234", arrow.Time64(0), true},
 		{arrow.Nanosecond, "12:34:56.78901234", arrow.Time64(12*h + 34*m + 56*s + 789012340), false},
-		{arrow.Nanosecond, "12:34:56.1234567890", arrow.Time64(0), true},
+		{arrow.Nanosecond, "12:34:56.123456789 9", arrow.Time64(0), true},
 	} {
 		t.Run("FromString", func(t *testing.T) {
 			v, e := arrow.Time64FromString(tc.str, tc.unit)

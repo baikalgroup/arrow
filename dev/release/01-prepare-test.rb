@@ -54,7 +54,9 @@ class PrepareTest < Test::Unit::TestCase
   def test_linux_packages
     user = "Arrow Developers"
     email = "dev@arrow.apache.org"
-    prepare("LINUX_PACKAGES", "DEBFULLNAME" => user, "DEBEMAIL" => email)
+    stdout = prepare("LINUX_PACKAGES",
+                     "DEBFULLNAME" => user,
+                     "DEBEMAIL" => email)
     changes = parse_patch(git("log", "-n", "1", "-p"))
     sampled_changes = changes.collect do |change|
       {
@@ -91,9 +93,10 @@ class PrepareTest < Test::Unit::TestCase
         ],
       },
     ]
-    assert_equal(expected_changes, sampled_changes)
+    assert_equal(expected_changes, sampled_changes, "Output:\n#{stdout}")
   end
 
+  data(:release_type, [:major, :minor, :patch])
   def test_version_pre_tag
     omit_on_release_branch
 
@@ -147,11 +150,40 @@ class PrepareTest < Test::Unit::TestCase
            "+  url \"https://www.apache.org/dyn/closer.lua?path=arrow/arrow-#{@release_version}/apache-arrow-#{@release_version}.tar.gz\""],
         ],
       },
+    ]
+    unless release_type == :patch
+      expected_changes += [
+        {
+          path: "docs/source/_static/versions.json",
+          hunks: [
+            [
+              "-        \"name\": \"#{@release_compatible_version} (dev)\",",
+              "+        \"name\": \"#{@next_compatible_version} (dev)\",",
+              "-        \"name\": \"#{@previous_compatible_version} (stable)\",",
+              "+        \"name\": \"#{@release_compatible_version} (stable)\",",
+              "+    {",
+              "+        \"name\": \"#{@previous_compatible_version}\",",
+              "+        \"version\": \"#{@previous_compatible_version}/\",",
+              "+        \"url\": \"https://arrow.apache.org/docs/#{@previous_compatible_version}/\"",
+              "+    },",
+            ],
+          ],
+        },
+      ]
+    end
+    expected_changes += [
       {
-        path: "dev/tasks/homebrew-formulae/autobrew/apache-arrow.rb",
+        path: "go/arrow/doc.go",
         hunks: [
-          ["-  url \"https://www.apache.org/dyn/closer.lua?path=arrow/arrow-#{@previous_version}.9000/apache-arrow-#{@previous_version}.9000.tar.gz\"",
-           "+  url \"https://www.apache.org/dyn/closer.lua?path=arrow/arrow-#{@release_version}/apache-arrow-#{@release_version}.tar.gz\""],
+          ["-const PkgVersion = \"#{@snapshot_version}\"",
+           "+const PkgVersion = \"#{@release_version}\""],
+        ],
+      },
+      {
+        path: "go/parquet/writer_properties.go",
+        hunks: [
+          ["-\tDefaultCreatedBy          = \"parquet-go version #{@snapshot_version}\"",
+           "+\tDefaultCreatedBy          = \"parquet-go version #{@release_version}\""],
         ],
       },
       {
@@ -166,6 +198,13 @@ class PrepareTest < Test::Unit::TestCase
         hunks: [
           ["-set(MLARROW_VERSION \"#{@snapshot_version}\")",
            "+set(MLARROW_VERSION \"#{@release_version}\")"],
+        ],
+      },
+      {
+        path: "python/CMakeLists.txt",
+        hunks: [
+          ["-set(PYARROW_VERSION \"#{@snapshot_version}\")",
+           "+set(PYARROW_VERSION \"#{@release_version}\")"],
         ],
       },
       {
@@ -190,6 +229,39 @@ class PrepareTest < Test::Unit::TestCase
         ],
       },
     ]
+    if release_type == :major
+      expected_changes += [
+        {
+          path: "r/pkgdown/assets/versions.json",
+          hunks: [
+            [
+              "-        \"name\": \"#{@previous_version}.9000 (dev)\",",
+              "+        \"name\": \"#{@release_version}.9000 (dev)\",",
+              "-        \"name\": \"#{@previous_r_version} (release)\",",
+              "+        \"name\": \"#{@release_version} (release)\",",
+              "+    {",
+              "+        \"name\": \"#{@previous_r_version}\",",
+              "+        \"version\": \"#{@previous_compatible_version}/\"",
+              "+    },",
+            ]
+          ],
+        },
+      ]
+    else
+      expected_changes += [
+        {
+          path: "r/pkgdown/assets/versions.json",
+          hunks: [
+            [
+              "-        \"name\": \"#{@previous_version}.9000 (dev)\",",
+              "+        \"name\": \"#{@release_version}.9000 (dev)\",",
+              "-        \"name\": \"#{@previous_r_version} (release)\",",
+              "+        \"name\": \"#{@release_version} (release)\",",
+            ]
+          ],
+        },
+      ]
+    end
 
     Dir.glob("java/**/pom.xml") do |path|
       version = "<version>#{@snapshot_version}</version>"
@@ -222,8 +294,9 @@ class PrepareTest < Test::Unit::TestCase
       }
     end
 
-    prepare("VERSION_PRE_TAG")
+    stdout = prepare("VERSION_PRE_TAG")
     assert_equal(expected_changes.sort_by {|diff| diff[:path]},
-                 parse_patch(git("log", "-n", "1", "-p")))
+                 parse_patch(git("log", "-n", "1", "-p")),
+                 "Output:\n#{stdout}")
   end
 end

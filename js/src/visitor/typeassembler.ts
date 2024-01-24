@@ -16,7 +16,6 @@
 // under the License.
 
 import * as flatbuffers from 'flatbuffers';
-import Long = flatbuffers.Long;
 import Builder = flatbuffers.Builder;
 
 import * as type from '../type.js';
@@ -26,15 +25,18 @@ import { Null } from '../fb/null.js';
 import { Int } from '../fb/int.js';
 import { FloatingPoint } from '../fb/floating-point.js';
 import { Binary } from '../fb/binary.js';
+import { LargeBinary } from '../fb/large-binary.js';
 import { Bool } from '../fb/bool.js';
 import { Utf8 } from '../fb/utf8.js';
+import { LargeUtf8 } from '../fb/large-utf8.js';
 import { Decimal } from '../fb/decimal.js';
 import { Date } from '../fb/date.js';
 import { Time } from '../fb/time.js';
 import { Timestamp } from '../fb/timestamp.js';
 import { Interval } from '../fb/interval.js';
+import { Duration } from '../fb/duration.js';
 import { List } from '../fb/list.js';
-import { Struct_ as Struct } from '../fb/struct_.js';
+import { Struct_ as Struct } from '../fb/struct-.js';
 import { Union } from '../fb/union.js';
 import { DictionaryEncoding } from '../fb/dictionary-encoding.js';
 import { FixedSizeBinary } from '../fb/fixed-size-binary.js';
@@ -70,6 +72,10 @@ export class TypeAssembler extends Visitor {
         Binary.startBinary(b);
         return Binary.endBinary(b);
     }
+    public visitLargeBinary<T extends type.LargeBinary>(_node: T, b: Builder) {
+        LargeBinary.startLargeBinary(b);
+        return LargeBinary.endLargeBinary(b);
+    }
     public visitBool<T extends type.Bool>(_node: T, b: Builder) {
         Bool.startBool(b);
         return Bool.endBool(b);
@@ -77,6 +83,10 @@ export class TypeAssembler extends Visitor {
     public visitUtf8<T extends type.Utf8>(_node: T, b: Builder) {
         Utf8.startUtf8(b);
         return Utf8.endUtf8(b);
+    }
+    public visitLargeUtf8<T extends type.LargeUtf8>(_node: T, b: Builder) {
+        LargeUtf8.startLargeUtf8(b);
+        return LargeUtf8.endLargeUtf8(b);
     }
     public visitDecimal<T extends type.Decimal>(node: T, b: Builder) {
         Decimal.startDecimal(b);
@@ -110,6 +120,11 @@ export class TypeAssembler extends Visitor {
         Interval.addUnit(b, node.unit);
         return Interval.endInterval(b);
     }
+    public visitDuration<T extends type.Duration>(node: T, b: Builder) {
+        Duration.startDuration(b);
+        Duration.addUnit(b, node.unit);
+        return Duration.endDuration(b);
+    }
     public visitList<T extends type.List>(_node: T, b: Builder) {
         List.startList(b);
         return List.endList(b);
@@ -129,7 +144,7 @@ export class TypeAssembler extends Visitor {
     public visitDictionary<T extends type.Dictionary>(node: T, b: Builder) {
         const indexType = this.visit(node.indices, b);
         DictionaryEncoding.startDictionaryEncoding(b);
-        DictionaryEncoding.addId(b, new Long(node.id, 0));
+        DictionaryEncoding.addId(b, BigInt(node.id));
         DictionaryEncoding.addIsOrdered(b, node.isOrdered);
         if (indexType !== undefined) {
             DictionaryEncoding.addIndexType(b, indexType);

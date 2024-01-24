@@ -18,21 +18,25 @@ package pqarrow
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/array"
-	"github.com/apache/arrow/go/v8/arrow/bitutil"
-	"github.com/apache/arrow/go/v8/arrow/decimal128"
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/apache/arrow/go/v8/parquet/internal/utils"
-	"github.com/apache/arrow/go/v8/parquet/schema"
-	"golang.org/x/xerrors"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/array"
+	"github.com/apache/arrow/go/v15/arrow/bitutil"
+	"github.com/apache/arrow/go/v15/arrow/decimal128"
+	"github.com/apache/arrow/go/v15/arrow/decimal256"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/internal/utils"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/schema"
+	"golang.org/x/sync/errgroup"
 )
 
 // column reader for leaf columns (non-nested)
@@ -43,17 +47,19 @@ type leafReader struct {
 	input     *columnIterator
 	descr     *schema.Column
 	recordRdr file.RecordReader
+	props     ArrowReadProperties
 
 	refCount int64
 }
 
-func newLeafReader(rctx *readerCtx, field *arrow.Field, input *columnIterator, leafInfo file.LevelInfo) (*ColumnReader, error) {
+func newLeafReader(rctx *readerCtx, field *arrow.Field, input *columnIterator, leafInfo file.LevelInfo, props ArrowReadProperties, bufferPool *sync.Pool) (*ColumnReader, error) {
 	ret := &leafReader{
 		rctx:      rctx,
 		field:     field,
 		input:     input,
 		descr:     input.Descr(),
-		recordRdr: file.NewRecordReader(input.Descr(), leafInfo, field.Type.ID() == arrow.DICTIONARY, rctx.mem),
+		recordRdr: file.NewRecordReader(input.Descr(), leafInfo, field.Type, rctx.mem, bufferPool),
+		props:     props,
 		refCount:  1,
 	}
 	err := ret.nextRowGroup()
@@ -66,10 +72,7 @@ func (lr *leafReader) Retain() {
 
 func (lr *leafReader) Release() {
 	if atomic.AddInt64(&lr.refCount, -1) == 0 {
-		if lr.out != nil {
-			lr.out.Release()
-			lr.out = nil
-		}
+		lr.releaseOut()
 		if lr.recordRdr != nil {
 			lr.recordRdr.Release()
 			lr.recordRdr = nil
@@ -88,10 +91,7 @@ func (lr *leafReader) GetRepLevels() ([]int16, error) {
 func (lr *leafReader) IsOrHasRepeatedChild() bool { return false }
 
 func (lr *leafReader) LoadBatch(nrecords int64) (err error) {
-	if lr.out != nil {
-		lr.out.Release()
-		lr.out = nil
-	}
+	lr.releaseOut()
 	lr.recordRdr.Reset()
 
 	if err := lr.recordRdr.Reserve(nrecords); err != nil {
@@ -112,12 +112,25 @@ func (lr *leafReader) LoadBatch(nrecords int64) (err error) {
 			}
 		}
 	}
-	lr.out, err = transferColumnData(lr.recordRdr, lr.field.Type, lr.descr, lr.rctx.mem)
+	lr.out, err = transferColumnData(lr.recordRdr, lr.field.Type, lr.descr)
 	return
 }
 
-func (lr *leafReader) BuildArray(_ int64) (*arrow.Chunked, error) {
-	return lr.out, nil
+func (lr *leafReader) BuildArray(int64) (*arrow.Chunked, error) {
+	return lr.clearOut(), nil
+}
+
+// releaseOut will clear lr.out as well as release it if it wasn't nil
+func (lr *leafReader) releaseOut() {
+	if out := lr.clearOut(); out != nil {
+		out.Release()
+	}
+}
+
+// clearOut will clear lt.out and return the old value
+func (lr *leafReader) clearOut() (out *arrow.Chunked) {
+	out, lr.out = lr.out, nil
+	return out
 }
 
 func (lr *leafReader) Field() *arrow.Field { return lr.field }
@@ -140,6 +153,7 @@ type structReader struct {
 	children         []*ColumnReader
 	defRepLevelChild *ColumnReader
 	hasRepeatedChild bool
+	props            ArrowReadProperties
 
 	refCount int64
 }
@@ -161,28 +175,27 @@ func (sr *structReader) Release() {
 	}
 }
 
-func newStructReader(rctx *readerCtx, filtered *arrow.Field, levelInfo file.LevelInfo, children []*ColumnReader) *ColumnReader {
-	// there could be a mix of children some might be repeated and some might not be
-	// if possible use one that isn't since that will be guaranteed to have the least
-	// number of levels to reconstruct a nullable bitmap
-	var result *ColumnReader
-	for _, child := range children {
-		if !child.IsOrHasRepeatedChild() {
-			result = child
-		}
-	}
-
+func newStructReader(rctx *readerCtx, filtered *arrow.Field, levelInfo file.LevelInfo, children []*ColumnReader, props ArrowReadProperties) *ColumnReader {
 	ret := &structReader{
 		rctx:      rctx,
 		filtered:  filtered,
 		levelInfo: levelInfo,
 		children:  children,
+		props:     props,
 		refCount:  1,
 	}
-	if result != nil {
-		ret.defRepLevelChild = result
-		ret.hasRepeatedChild = false
-	} else {
+
+	// there could be a mix of children some might be repeated and some might not be
+	// if possible use one that isn't since that will be guaranteed to have the least
+	// number of levels to reconstruct a nullable bitmap
+	for _, child := range children {
+		if !child.IsOrHasRepeatedChild() {
+			ret.defRepLevelChild = child
+			break
+		}
+	}
+
+	if ret.defRepLevelChild == nil {
 		ret.defRepLevelChild = children[0]
 		ret.hasRepeatedChild = true
 	}
@@ -194,7 +207,7 @@ func (sr *structReader) IsOrHasRepeatedChild() bool { return sr.hasRepeatedChild
 
 func (sr *structReader) GetDefLevels() ([]int16, error) {
 	if len(sr.children) == 0 {
-		return nil, xerrors.New("struct raeder has no children")
+		return nil, errors.New("struct reader has no children")
 	}
 
 	// this method should only be called when this struct or one of its parents
@@ -205,7 +218,7 @@ func (sr *structReader) GetDefLevels() ([]int16, error) {
 
 func (sr *structReader) GetRepLevels() ([]int16, error) {
 	if len(sr.children) == 0 {
-		return nil, xerrors.New("struct raeder has no children")
+		return nil, errors.New("struct reader has no children")
 	}
 
 	// this method should only be called when this struct or one of its parents
@@ -215,12 +228,22 @@ func (sr *structReader) GetRepLevels() ([]int16, error) {
 }
 
 func (sr *structReader) LoadBatch(nrecords int64) error {
-	for _, rdr := range sr.children {
-		if err := rdr.LoadBatch(nrecords); err != nil {
-			return err
-		}
+	// Load batches in parallel
+	// When reading structs with large numbers of columns, the serial load is very slow.
+	// This is especially true when reading Cloud Storage. Loading concurrently
+	// greatly improves performance.
+	g := new(errgroup.Group)
+	if !sr.props.Parallel {
+		g.SetLimit(1)
 	}
-	return nil
+	for _, rdr := range sr.children {
+		rdr := rdr
+		g.Go(func() error {
+			return rdr.LoadBatch(nrecords)
+		})
+	}
+
+	return g.Wait()
 }
 
 func (sr *structReader) Field() *arrow.Field { return sr.filtered }
@@ -233,51 +256,48 @@ func (sr *structReader) BuildArray(lenBound int64) (*arrow.Chunked, error) {
 
 	var nullBitmap *memory.Buffer
 
-	if sr.hasRepeatedChild {
+	if lenBound > 0 && (sr.hasRepeatedChild || sr.filtered.Nullable) {
 		nullBitmap = memory.NewResizableBuffer(sr.rctx.mem)
 		nullBitmap.Resize(int(bitutil.BytesForBits(lenBound)))
-		validityIO.ValidBits = nullBitmap.Bytes()
-		defLevels, err := sr.GetDefLevels()
-		if err != nil {
-			return nil, err
-		}
-		repLevels, err := sr.GetRepLevels()
-		if err != nil {
-			return nil, err
-		}
-
-		if err := file.DefRepLevelsToBitmap(defLevels, repLevels, sr.levelInfo, &validityIO); err != nil {
-			return nil, err
-		}
-
-	} else if sr.filtered.Nullable {
-		nullBitmap = memory.NewResizableBuffer(sr.rctx.mem)
-		nullBitmap.Resize(int(bitutil.BytesForBits(lenBound)))
+		defer nullBitmap.Release()
 		validityIO.ValidBits = nullBitmap.Bytes()
 		defLevels, err := sr.GetDefLevels()
 		if err != nil {
 			return nil, err
 		}
 
-		file.DefLevelsToBitmap(defLevels, sr.levelInfo, &validityIO)
+		if sr.hasRepeatedChild {
+			repLevels, err := sr.GetRepLevels()
+			if err != nil {
+				return nil, err
+			}
+
+			if err := file.DefRepLevelsToBitmap(defLevels, repLevels, sr.levelInfo, &validityIO); err != nil {
+				return nil, err
+			}
+		} else {
+			file.DefLevelsToBitmap(defLevels, sr.levelInfo, &validityIO)
+		}
 	}
 
 	if nullBitmap != nil {
 		nullBitmap.Resize(int(bitutil.BytesForBits(validityIO.Read)))
 	}
 
-	childArrData := make([]arrow.ArrayData, 0)
+	childArrData := make([]arrow.ArrayData, len(sr.children))
+	defer releaseArrayData(childArrData)
 	// gather children arrays and def levels
-	for _, child := range sr.children {
-		field, err := child.BuildArray(validityIO.Read)
+	for i, child := range sr.children {
+		field, err := child.BuildArray(lenBound)
 		if err != nil {
 			return nil, err
 		}
-		arrdata, err := chunksToSingle(field)
+
+		childArrData[i], err = chunksToSingle(field)
+		field.Release() // release field before checking
 		if err != nil {
 			return nil, err
 		}
-		childArrData = append(childArrData, arrdata)
 	}
 
 	if !sr.filtered.Nullable && !sr.hasRepeatedChild {
@@ -291,24 +311,24 @@ func (sr *structReader) BuildArray(lenBound int64) (*arrow.Chunked, error) {
 
 	data := array.NewData(sr.filtered.Type, int(validityIO.Read), buffers, childArrData, int(validityIO.NullCount), 0)
 	defer data.Release()
-	arr := array.MakeFromData(data)
+	arr := array.NewStructData(data)
 	defer arr.Release()
 	return arrow.NewChunked(sr.filtered.Type, []arrow.Array{arr}), nil
 }
 
 // column reader for repeated columns specifically for list arrays
 type listReader struct {
-	rctx    *readerCtx
-	field   *arrow.Field
-	info    file.LevelInfo
-	itemRdr *ColumnReader
-
+	rctx     *readerCtx
+	field    *arrow.Field
+	info     file.LevelInfo
+	itemRdr  *ColumnReader
+	props    ArrowReadProperties
 	refCount int64
 }
 
-func newListReader(rctx *readerCtx, field *arrow.Field, info file.LevelInfo, childRdr *ColumnReader) *ColumnReader {
+func newListReader(rctx *readerCtx, field *arrow.Field, info file.LevelInfo, childRdr *ColumnReader, props ArrowReadProperties) *ColumnReader {
 	childRdr.Retain()
-	return &ColumnReader{&listReader{rctx, field, info, childRdr, 1}}
+	return &ColumnReader{&listReader{rctx, field, info, childRdr, props, 1}}
 }
 
 func (lr *listReader) Retain() {
@@ -371,10 +391,16 @@ func (lr *listReader) BuildArray(lenBound int64) (*arrow.Chunked, error) {
 		return nil, err
 	}
 
-	arr, err := lr.itemRdr.BuildArray(int64(offsetData[int(validityIO.Read)]))
+	// if the parent (itemRdr) has nulls and is a nested type like list
+	// then we need BuildArray to account for that with the number of
+	// definition levels when building out the bitmap. So the upper bound
+	// to make sure we have the space for is the worst case scenario,
+	// the upper bound is the value of the last offset + the nullcount
+	arr, err := lr.itemRdr.BuildArray(int64(offsetData[int(validityIO.Read)]) + validityIO.NullCount)
 	if err != nil {
 		return nil, err
 	}
+	defer arr.Release()
 
 	// resize to actual number of elems returned
 	offsetsBuffer.Resize(arrow.Int32Traits.BytesRequired(int(validityIO.Read) + 1))
@@ -401,7 +427,7 @@ func (lr *listReader) BuildArray(lenBound int64) (*arrow.Chunked, error) {
 		for x := 1; x < data.Len(); x++ {
 			size := offsetData[x] - offsetData[x-1]
 			if size != listSize {
-				return nil, xerrors.Errorf("expected all lists to be of size=%d, but index %d had size=%d", listSize, x, size)
+				return nil, fmt.Errorf("expected all lists to be of size=%d, but index %d had size=%d", listSize, x, size)
 			}
 		}
 		data.Buffers()[1] = nil
@@ -416,9 +442,9 @@ type fixedSizeListReader struct {
 	listReader
 }
 
-func newFixedSizeListReader(rctx *readerCtx, field *arrow.Field, info file.LevelInfo, childRdr *ColumnReader) *ColumnReader {
+func newFixedSizeListReader(rctx *readerCtx, field *arrow.Field, info file.LevelInfo, childRdr *ColumnReader, props ArrowReadProperties) *ColumnReader {
 	childRdr.Retain()
-	return &ColumnReader{&fixedSizeListReader{listReader{rctx, field, info, childRdr, 1}}}
+	return &ColumnReader{&fixedSizeListReader{listReader{rctx, field, info, childRdr, props, 1}}}
 }
 
 // helper function to combine chunks into a single array.
@@ -429,17 +455,25 @@ func chunksToSingle(chunked *arrow.Chunked) (arrow.ArrayData, error) {
 	case 0:
 		return array.NewData(chunked.DataType(), 0, []*memory.Buffer{nil, nil}, nil, 0, 0), nil
 	case 1:
-		return chunked.Chunk(0).Data(), nil
+		data := chunked.Chunk(0).Data()
+		data.Retain() // we pass control to the caller
+		return data, nil
 	default: // if an item reader yields a chunked array, this is not yet implemented
-		return nil, xerrors.New("not implemented")
+		return nil, arrow.ErrNotImplemented
 	}
 }
 
 // create a chunked arrow array from the raw record data
-func transferColumnData(rdr file.RecordReader, valueType arrow.DataType, descr *schema.Column, mem memory.Allocator) (*arrow.Chunked, error) {
+func transferColumnData(rdr file.RecordReader, valueType arrow.DataType, descr *schema.Column) (*arrow.Chunked, error) {
+	dt := valueType
+	if valueType.ID() == arrow.EXTENSION {
+		dt = valueType.(arrow.ExtensionType).StorageType()
+	}
+
 	var data arrow.ArrayData
-	switch valueType.ID() {
-	// case arrow.DICTIONARY:
+	switch dt.ID() {
+	case arrow.DICTIONARY:
+		return transferDictionary(rdr, valueType), nil
 	case arrow.NULL:
 		return arrow.NewChunked(arrow.Null, []arrow.Array{array.NewNull(rdr.ValuesWritten())}), nil
 	case arrow.INT32, arrow.INT64, arrow.FLOAT32, arrow.FLOAT64:
@@ -458,16 +492,16 @@ func transferColumnData(rdr file.RecordReader, valueType arrow.DataType, descr *
 		data = transferInt(rdr, valueType)
 	case arrow.DATE64:
 		data = transferDate64(rdr, valueType)
-	case arrow.FIXED_SIZE_BINARY, arrow.BINARY, arrow.STRING:
+	case arrow.FIXED_SIZE_BINARY, arrow.BINARY, arrow.STRING, arrow.LARGE_BINARY, arrow.LARGE_STRING:
 		return transferBinary(rdr, valueType), nil
-	case arrow.DECIMAL:
+	case arrow.DECIMAL, arrow.DECIMAL256:
 		switch descr.PhysicalType() {
 		case parquet.Types.Int32, parquet.Types.Int64:
 			data = transferDecimalInteger(rdr, valueType)
 		case parquet.Types.ByteArray, parquet.Types.FixedLenByteArray:
 			return transferDecimalBytes(rdr.(file.BinaryRecordReader), valueType)
 		default:
-			return nil, xerrors.New("physical type for decimal128 must be int32, int64, bytearray or fixed len byte array")
+			return nil, errors.New("physical type for decimal128/decimal256 must be int32, int64, bytearray or fixed len byte array")
 		}
 	case arrow.TIMESTAMP:
 		tstype := valueType.(*arrow.TimestampType)
@@ -481,10 +515,18 @@ func transferColumnData(rdr file.RecordReader, valueType arrow.DataType, descr *
 				data = transferZeroCopy(rdr, valueType)
 			}
 		default:
-			return nil, xerrors.New("time unit not supported")
+			return nil, errors.New("time unit not supported")
 		}
+	case arrow.FLOAT16:
+		if descr.PhysicalType() != parquet.Types.FixedLenByteArray {
+			return nil, errors.New("physical type for float16 must be fixed len byte array")
+		}
+		if len := arrow.Float16SizeBytes; descr.TypeLength() != len {
+			return nil, fmt.Errorf("fixed len byte array length for float16 must be %d", len)
+		}
+		return transferBinary(rdr, valueType), nil
 	default:
-		return nil, xerrors.Errorf("no support for reading columns of type: %s", valueType.Name())
+		return nil, fmt.Errorf("no support for reading columns of type: %s", valueType.Name())
 	}
 
 	defer data.Release()
@@ -505,20 +547,37 @@ func transferZeroCopy(rdr file.RecordReader, dt arrow.DataType) arrow.ArrayData 
 		}
 	}()
 
-	return array.NewData(dt, rdr.ValuesWritten(), []*memory.Buffer{
-		bitmap, values}, nil, int(rdr.NullCount()), 0)
+	return array.NewData(dt, rdr.ValuesWritten(),
+		[]*memory.Buffer{bitmap, values},
+		nil, int(rdr.NullCount()), 0)
 }
 
 func transferBinary(rdr file.RecordReader, dt arrow.DataType) *arrow.Chunked {
 	brdr := rdr.(file.BinaryRecordReader)
+	if brdr.ReadDictionary() {
+		return transferDictionary(brdr, &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: dt})
+	}
 	chunks := brdr.GetBuilderChunks()
-	if dt == arrow.BinaryTypes.String {
-		// convert chunks from binary to string without copying data,
-		// just changing the interpretation of the metadata
-		for idx := range chunks {
-			chunks[idx] = array.MakeFromData(chunks[idx].Data())
-			defer chunks[idx].Data().Release()
-			defer chunks[idx].Release()
+	defer releaseArrays(chunks)
+
+	switch dt := dt.(type) {
+	case arrow.ExtensionType:
+		for idx, chunk := range chunks {
+			chunks[idx] = array.NewExtensionArrayWithStorage(dt, chunk)
+			chunk.Release()
+		}
+	case *arrow.StringType, *arrow.LargeStringType:
+		for idx, chunk := range chunks {
+			chunks[idx] = array.MakeFromData(chunk.Data())
+			chunk.Release()
+		}
+	case *arrow.Float16Type:
+		for idx, chunk := range chunks {
+			data := chunk.Data()
+			f16_data := array.NewData(dt, data.Len(), data.Buffers(), nil, data.NullN(), data.Offset())
+			defer f16_data.Release()
+			chunks[idx] = array.NewFloat16Data(f16_data)
+			chunk.Release()
 		}
 	}
 	return arrow.NewChunked(dt, chunks)
@@ -613,8 +672,10 @@ func transferBool(rdr file.RecordReader) arrow.ArrayData {
 	if bitmap != nil {
 		defer bitmap.Release()
 	}
+	bb := memory.NewBufferBytes(data)
+	defer bb.Release()
 	return array.NewData(&arrow.BooleanType{}, length, []*memory.Buffer{
-		bitmap, memory.NewBufferBytes(data),
+		bitmap, bb,
 	}, nil, int(rdr.NullCount()), 0)
 }
 
@@ -678,10 +739,20 @@ func transferDecimalInteger(rdr file.RecordReader, dt arrow.DataType) arrow.Arra
 		values = reflect.ValueOf(arrow.Int64Traits.CastFromBytes(rdr.Values())[:length])
 	}
 
-	data := make([]byte, arrow.Decimal128Traits.BytesRequired(length))
-	out := arrow.Decimal128Traits.CastFromBytes(data)
-	for i := 0; i < values.Len(); i++ {
-		out[i] = decimal128.FromI64(values.Index(i).Int())
+	var data []byte
+	switch dt.ID() {
+	case arrow.DECIMAL128:
+		data = make([]byte, arrow.Decimal128Traits.BytesRequired(length))
+		out := arrow.Decimal128Traits.CastFromBytes(data)
+		for i := 0; i < values.Len(); i++ {
+			out[i] = decimal128.FromI64(values.Index(i).Int())
+		}
+	case arrow.DECIMAL256:
+		data = make([]byte, arrow.Decimal256Traits.BytesRequired(length))
+		out := arrow.Decimal256Traits.CastFromBytes(data)
+		for i := 0; i < values.Len(); i++ {
+			out[i] = decimal256.FromI64(values.Index(i).Int())
+		}
 	}
 
 	var nullmap *memory.Buffer
@@ -711,7 +782,7 @@ func bigEndianToDecimal128(buf []byte) (decimal128.Num, error) {
 	)
 
 	if len(buf) < minDecimalBytes || len(buf) > maxDecimalBytes {
-		return decimal128.Num{}, xerrors.Errorf("length of byte array passed to bigEndianToDecimal128 was %d but must be between %d and %d",
+		return decimal128.Num{}, fmt.Errorf("length of byte array passed to bigEndianToDecimal128 was %d but must be between %d and %d",
 			len(buf), minDecimalBytes, maxDecimalBytes)
 	}
 
@@ -719,7 +790,7 @@ func bigEndianToDecimal128(buf []byte) (decimal128.Num, error) {
 	isNeg := int8(buf[0]) < 0
 
 	// 1. extract high bits
-	highBitsOffset := utils.MaxInt(0, len(buf)-8)
+	highBitsOffset := utils.Max(0, len(buf)-8)
 	var (
 		highBits uint64
 		lowBits  uint64
@@ -740,7 +811,7 @@ func bigEndianToDecimal128(buf []byte) (decimal128.Num, error) {
 	}
 
 	// 2. extract lower bits
-	lowBitsOffset := utils.MinInt(len(buf), 8)
+	lowBitsOffset := utils.Min(len(buf), 8)
 	lowBits = uint64FromBigEndianShifted(buf[highBitsOffset:])
 
 	if lowBitsOffset == 8 {
@@ -757,6 +828,52 @@ func bigEndianToDecimal128(buf []byte) (decimal128.Num, error) {
 	return decimal128.New(hi, uint64(lo)), nil
 }
 
+func bigEndianToDecimal256(buf []byte) (decimal256.Num, error) {
+	const (
+		minDecimalBytes = 1
+		maxDecimalBytes = 32
+	)
+
+	if len(buf) < minDecimalBytes || len(buf) > maxDecimalBytes {
+		return decimal256.Num{},
+			fmt.Errorf("%w: length of byte array for bigEndianToDecimal256 was %d but must be between %d and %d",
+				arrow.ErrInvalid, len(buf), minDecimalBytes, maxDecimalBytes)
+	}
+
+	var littleEndian [4]uint64
+	// bytes are coming in big-endian, so the first byte is the MSB and
+	// therefore holds the sign bit
+	initWord, isNeg := uint64(0), int8(buf[0]) < 0
+	if isNeg {
+		// sign extend if necessary
+		initWord = uint64(0xFFFFFFFFFFFFFFFF)
+	}
+
+	for wordIdx := 0; wordIdx < 4; wordIdx++ {
+		wordLen := utils.Min(len(buf), arrow.Uint64SizeBytes)
+		word := buf[len(buf)-wordLen:]
+
+		if wordLen == 8 {
+			// full words can be assigned as-is
+			littleEndian[wordIdx] = binary.BigEndian.Uint64(word)
+		} else {
+			result := initWord
+			if len(buf) > 0 {
+				// incorporate the actual values if present
+				// shift left enough bits to make room for the incoming int64
+				result = result << uint64(wordLen)
+				// preserve the upper bits by inplace OR-ing the int64
+				result |= uint64FromBigEndianShifted(word)
+			}
+			littleEndian[wordIdx] = result
+		}
+
+		buf = buf[:len(buf)-wordLen]
+	}
+
+	return decimal256.New(littleEndian[3], littleEndian[2], littleEndian[1], littleEndian[0]), nil
+}
+
 type varOrFixedBin interface {
 	arrow.Array
 	Value(i int) []byte
@@ -764,23 +881,21 @@ type varOrFixedBin interface {
 
 // convert physical byte storage, instead of integers, to decimal128
 func transferDecimalBytes(rdr file.BinaryRecordReader, dt arrow.DataType) (*arrow.Chunked, error) {
-	convert := func(arr arrow.Array) (arrow.Array, error) {
-		length := arr.Len()
+	convert128 := func(in varOrFixedBin) (arrow.Array, error) {
+		length := in.Len()
 		data := make([]byte, arrow.Decimal128Traits.BytesRequired(length))
 		out := arrow.Decimal128Traits.CastFromBytes(data)
 
-		input := arr.(varOrFixedBin)
-		nullCount := input.NullN()
-
+		nullCount := in.NullN()
 		var err error
 		for i := 0; i < length; i++ {
-			if nullCount > 0 && input.IsNull(i) {
+			if nullCount > 0 && in.IsNull(i) {
 				continue
 			}
 
-			rec := input.Value(i)
+			rec := in.Value(i)
 			if len(rec) <= 0 {
-				return nil, xerrors.Errorf("invalud BYTEARRAY length for type: %s", dt)
+				return nil, fmt.Errorf("invalid BYTEARRAY length for type: %s", dt)
 			}
 			out[i], err = bigEndianToDecimal128(rec)
 			if err != nil {
@@ -789,10 +904,49 @@ func transferDecimalBytes(rdr file.BinaryRecordReader, dt arrow.DataType) (*arro
 		}
 
 		ret := array.NewData(dt, length, []*memory.Buffer{
-			input.Data().Buffers()[0], memory.NewBufferBytes(data),
+			in.Data().Buffers()[0], memory.NewBufferBytes(data),
 		}, nil, nullCount, 0)
 		defer ret.Release()
 		return array.MakeFromData(ret), nil
+	}
+
+	convert256 := func(in varOrFixedBin) (arrow.Array, error) {
+		length := in.Len()
+		data := make([]byte, arrow.Decimal256Traits.BytesRequired(length))
+		out := arrow.Decimal256Traits.CastFromBytes(data)
+
+		nullCount := in.NullN()
+		var err error
+		for i := 0; i < length; i++ {
+			if nullCount > 0 && in.IsNull(i) {
+				continue
+			}
+
+			rec := in.Value(i)
+			if len(rec) <= 0 {
+				return nil, fmt.Errorf("invalid BYTEARRAY length for type: %s", dt)
+			}
+			out[i], err = bigEndianToDecimal256(rec)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		ret := array.NewData(dt, length, []*memory.Buffer{
+			in.Data().Buffers()[0], memory.NewBufferBytes(data),
+		}, nil, nullCount, 0)
+		defer ret.Release()
+		return array.MakeFromData(ret), nil
+	}
+
+	convert := func(arr arrow.Array) (arrow.Array, error) {
+		switch dt.ID() {
+		case arrow.DECIMAL128:
+			return convert128(arr.(varOrFixedBin))
+		case arrow.DECIMAL256:
+			return convert256(arr.(varOrFixedBin))
+		}
+		return nil, arrow.ErrNotImplemented
 	}
 
 	chunks := rdr.GetBuilderChunks()
@@ -805,4 +959,11 @@ func transferDecimalBytes(rdr file.BinaryRecordReader, dt arrow.DataType) (*arro
 		defer chunks[idx].Release()
 	}
 	return arrow.NewChunked(dt, chunks), nil
+}
+
+func transferDictionary(rdr file.RecordReader, logicalValueType arrow.DataType) *arrow.Chunked {
+	brdr := rdr.(file.BinaryRecordReader)
+	chunks := brdr.GetBuilderChunks()
+	defer releaseArrays(chunks)
+	return arrow.NewChunked(logicalValueType, chunks)
 }

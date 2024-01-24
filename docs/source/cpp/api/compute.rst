@@ -31,6 +31,13 @@ Abstract Function classes
    :content-only:
    :members:
 
+Function execution
+------------------
+
+.. doxygengroup:: compute-function-executor
+   :content-only:
+   :members:
+
 Function registry
 -----------------
 
@@ -55,26 +62,8 @@ Concrete options classes
 
 .. TODO: List concrete function invocation shortcuts?
 
-Streaming Execution
-===================
-
-Streaming Execution Operators
------------------------------
-
-.. doxygenenum:: arrow::compute::JoinType
-
-.. doxygenenum:: arrow::compute::JoinKeyCmp
-
-.. doxygengroup:: execnode-options
-   :content-only:
-   :members:
-   :undoc-members:
-
-Execution Plan Expressions
---------------------------
-
-.. doxygenclass:: arrow::FieldRef
-   :members:
+Compute Expressions
+-------------------
 
 .. doxygengroup:: expression-core
    :content-only:

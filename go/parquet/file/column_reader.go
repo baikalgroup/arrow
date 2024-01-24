@@ -17,13 +17,17 @@
 package file
 
 import (
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/internal/encoding"
-	"github.com/apache/arrow/go/v8/parquet/internal/encryption"
-	format "github.com/apache/arrow/go/v8/parquet/internal/gen-go/parquet"
-	"github.com/apache/arrow/go/v8/parquet/internal/utils"
-	"github.com/apache/arrow/go/v8/parquet/schema"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/internal/utils"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/internal/encoding"
+	"github.com/apache/arrow/go/v15/parquet/internal/encryption"
+	format "github.com/apache/arrow/go/v15/parquet/internal/gen-go/parquet"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"golang.org/x/xerrors"
 )
 
@@ -123,6 +127,7 @@ type columnChunkReader struct {
 	// the number of values we've decoded so far
 	numDecoded int64
 	mem        memory.Allocator
+	bufferPool *sync.Pool
 
 	decoders      map[format.Encoding]encoding.TypedDecoder
 	decoderTraits encoding.DecoderTraits
@@ -130,12 +135,18 @@ type columnChunkReader struct {
 	// is set when an error is encountered
 	err          error
 	defLvlBuffer []int16
+
+	newDictionary bool
 }
 
 // NewColumnReader returns a column reader for the provided column initialized with the given pagereader that will
 // provide the pages of data for this column. The type is determined from the column passed in.
-func NewColumnReader(descr *schema.Column, pageReader PageReader, mem memory.Allocator) ColumnChunkReader {
-	base := columnChunkReader{descr: descr, rdr: pageReader, mem: mem, decoders: make(map[format.Encoding]encoding.TypedDecoder)}
+//
+// In addition to the page reader and allocator, a pointer to a shared sync.Pool is expected to provide buffers for temporary
+// usage to minimize allocations. The bufferPool should provide *memory.Buffer objects that can be resized as necessary, buffers
+// should have `ResizeNoShrink(0)` called on them before being put back into the pool.
+func NewColumnReader(descr *schema.Column, pageReader PageReader, mem memory.Allocator, bufferPool *sync.Pool) ColumnChunkReader {
+	base := columnChunkReader{descr: descr, rdr: pageReader, mem: mem, decoders: make(map[format.Encoding]encoding.TypedDecoder), bufferPool: bufferPool}
 	switch descr.PhysicalType() {
 	case parquet.Types.FixedLenByteArray:
 		base.decoderTraits = &encoding.FixedLenByteArrayDecoderTraits
@@ -217,6 +228,7 @@ func (c *columnChunkReader) configureDict(page *DictionaryPage) error {
 		return xerrors.New("parquet: dictionary index must be plain encoding")
 	}
 
+	c.newDictionary = true
 	c.curDecoder = c.decoders[enc]
 	return nil
 }
@@ -271,8 +283,12 @@ func (c *columnChunkReader) initLevelDecodersV2(page *DataPageV2) (int64, error)
 
 	if c.descr.MaxRepetitionLevel() > 0 {
 		c.repetitionDecoder.SetDataV2(page.repLvlByteLen, c.descr.MaxRepetitionLevel(), int(c.numBuffered), buf)
-		buf = buf[page.repLvlByteLen:]
 	}
+	// ARROW-17453: Some writers will write repetition levels even when
+	// the max repetition level is 0, so we should respect the value
+	// in the page header regardless of whether MaxRepetitionLevel is 0
+	// or not.
+	buf = buf[page.repLvlByteLen:]
 
 	if c.descr.MaxDefinitionLevel() > 0 {
 		c.definitionDecoder.SetDataV2(page.defLvlByteLen, c.descr.MaxDefinitionLevel(), int(c.numBuffered), buf)
@@ -330,6 +346,11 @@ func (c *columnChunkReader) initDataDecoder(page Page, lvlByteLen int64) error {
 		c.curDecoder = decoder
 	} else {
 		switch encoding {
+		case format.Encoding_RLE:
+			if c.descr.PhysicalType() != parquet.Types.Boolean {
+				return fmt.Errorf("parquet: only boolean supports RLE encoding, got %s", c.descr.PhysicalType())
+			}
+			fallthrough
 		case format.Encoding_PLAIN,
 			format.Encoding_DELTA_BYTE_ARRAY,
 			format.Encoding_DELTA_LENGTH_BYTE_ARRAY,
@@ -337,11 +358,11 @@ func (c *columnChunkReader) initDataDecoder(page Page, lvlByteLen int64) error {
 			c.curDecoder = c.decoderTraits.Decoder(parquet.Encoding(encoding), c.descr, false, c.mem)
 			c.decoders[encoding] = c.curDecoder
 		case format.Encoding_RLE_DICTIONARY:
-			return xerrors.New("parquet: dictionary page must be before data page")
+			return errors.New("parquet: dictionary page must be before data page")
 		case format.Encoding_BYTE_STREAM_SPLIT:
-			return xerrors.Errorf("parquet: unsupported data encoding %s", encoding)
+			return fmt.Errorf("parquet: unsupported data encoding %s", encoding)
 		default:
-			return xerrors.Errorf("parquet: unknown encoding type %s", encoding)
+			return fmt.Errorf("parquet: unknown encoding type %s", encoding)
 		}
 	}
 
@@ -433,9 +454,17 @@ func (c *columnChunkReader) skipValues(nvalues int64, readFn func(batch int64, b
 				valsRead  int64 = 0
 			)
 
-			scratch := memory.NewResizableBuffer(c.mem)
-			scratch.Reserve(c.decoderTraits.BytesRequired(int(batchSize)))
-			defer scratch.Release()
+			scratch := c.bufferPool.Get().(*memory.Buffer)
+			defer func() {
+				scratch.ResizeNoShrink(0)
+				c.bufferPool.Put(scratch)
+			}()
+			bufMult := 1
+			if c.descr.PhysicalType() == parquet.Types.Boolean {
+				// for bools, BytesRequired returns 1 byte per 8 bool, but casting []byte to []bool requires 1 byte per 1 bool
+				bufMult = 8
+			}
+			scratch.Reserve(c.decoderTraits.BytesRequired(int(batchSize) * bufMult))
 
 			for {
 				batchSize = utils.Min(batchSize, toskip)
@@ -488,7 +517,7 @@ func (c *columnChunkReader) readBatch(batchSize int64, defLvls, repLvls []int16,
 		// if this is a required field, ndefs will be 0 since there is no definition
 		// levels stored with it and `read` will be the number of values, otherwise
 		// we use ndefs since it will be equal to or greater than read.
-		totalVals := int64(utils.MaxInt(ndefs, read))
+		totalVals := int64(utils.Max(ndefs, read))
 		c.consumeBufferedValues(totalVals)
 
 		totalLvls += totalVals

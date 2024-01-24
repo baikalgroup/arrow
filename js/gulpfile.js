@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import del from "del";
+import { deleteAsync as del } from 'del';
 import os from "os";
 import gulp from "gulp";
 import { targets } from "./gulp/argv.js";
@@ -53,6 +53,10 @@ knownTargets.forEach((target) => {
         }
     ));
 });
+
+gulp.task(`build:ts`, gulp.series(
+    `build:es5:umd`, `clean:ts`, `compile:ts`, `package:ts`
+));
 
 // The main "apache-arrow" module builds the es2015/umd, es2015/cjs,
 // es2015/esm, and esnext/umd targets, then copies and renames the

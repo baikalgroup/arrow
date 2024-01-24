@@ -17,31 +17,29 @@
 
 #include "arrow/engine/substrait/type_internal.h"
 
+#include <array>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
+#include "arrow/engine/substrait/extension_set.h"
 #include "arrow/engine/substrait/extension_types.h"
+#include "arrow/engine/substrait/options.h"
+#include "arrow/extension_type.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/make_unique.h"
+#include "arrow/type_fwd.h"
 #include "arrow/visit_type_inline.h"
 
 namespace arrow {
 namespace engine {
 
-namespace internal {
-using ::arrow::internal::make_unique;
-}  // namespace internal
-
 namespace {
-
-template <typename TypeMessage>
-Status CheckVariation(const TypeMessage& type) {
-  if (type.type_variation_reference() == 0) return Status::OK();
-  return Status::NotImplemented("Type variations for ", type.DebugString());
-}
 
 template <typename TypeMessage>
 bool IsNullable(const TypeMessage& type) {
@@ -52,8 +50,6 @@ bool IsNullable(const TypeMessage& type) {
 template <typename ArrowType, typename TypeMessage, typename... A>
 Result<std::pair<std::shared_ptr<DataType>, bool>> FromProtoImpl(const TypeMessage& type,
                                                                  A&&... args) {
-  RETURN_NOT_OK(CheckVariation(type));
-
   return std::make_pair(std::static_pointer_cast<DataType>(
                             std::make_shared<ArrowType>(std::forward<A>(args)...)),
                         IsNullable(type));
@@ -62,8 +58,6 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProtoImpl(const TypeMessa
 template <typename TypeMessage, typename... A>
 Result<std::pair<std::shared_ptr<DataType>, bool>> FromProtoImpl(
     const TypeMessage& type, std::shared_ptr<DataType> type_factory(A...), A&&... args) {
-  RETURN_NOT_OK(CheckVariation(type));
-
   return std::make_pair(
       std::static_pointer_cast<DataType>(type_factory(std::forward<A>(args)...)),
       IsNullable(type));
@@ -72,7 +66,8 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProtoImpl(
 template <typename Types, typename NextName>
 Result<FieldVector> FieldsFromProto(int size, const Types& types,
                                     const NextName& next_name,
-                                    const ExtensionSet& ext_set) {
+                                    const ExtensionSet& ext_set,
+                                    const ConversionOptions& conversion_options) {
   FieldVector fields(size);
   for (int i = 0; i < size; ++i) {
     std::string name = next_name();
@@ -83,12 +78,14 @@ Result<FieldVector> FieldsFromProto(int size, const Types& types,
       const auto& struct_ = types.Get(i).struct_();
 
       ARROW_ASSIGN_OR_RAISE(
-          type, FieldsFromProto(struct_.types_size(), struct_.types(), next_name, ext_set)
-                    .Map(arrow::struct_));
+          auto fields, FieldsFromProto(struct_.types_size(), struct_.types(), next_name,
+                                       ext_set, conversion_options));
+      type = ::arrow::struct_(std::move(fields));
 
       nullable = IsNullable(struct_);
     } else {
-      ARROW_ASSIGN_OR_RAISE(std::tie(type, nullable), FromProto(types.Get(i), ext_set));
+      ARROW_ASSIGN_OR_RAISE(std::tie(type, nullable),
+                            FromProto(types.Get(i), ext_set, conversion_options));
     }
 
     fields[i] = field(std::move(name), std::move(type), nullable);
@@ -99,7 +96,8 @@ Result<FieldVector> FieldsFromProto(int size, const Types& types,
 }  // namespace
 
 Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(
-    const substrait::Type& type, const ExtensionSet& ext_set) {
+    const substrait::Type& type, const ExtensionSet& ext_set,
+    const ConversionOptions& conversion_options) {
   switch (type.kind_case()) {
     case substrait::Type::kBool:
       return FromProtoImpl<BooleanType>(type.bool_());
@@ -161,9 +159,10 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(
     case substrait::Type::kStruct: {
       const auto& struct_ = type.struct_();
 
-      ARROW_ASSIGN_OR_RAISE(auto fields, FieldsFromProto(
-                                             struct_.types_size(), struct_.types(),
-                                             /*next_name=*/[] { return ""; }, ext_set));
+      ARROW_ASSIGN_OR_RAISE(
+          auto fields, FieldsFromProto(
+                           struct_.types_size(), struct_.types(),
+                           /*next_name=*/[] { return ""; }, ext_set, conversion_options));
 
       return FromProtoImpl<StructType>(struct_, std::move(fields));
     }
@@ -177,7 +176,8 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(
             list.DebugString());
       }
 
-      ARROW_ASSIGN_OR_RAISE(auto type_nullable, FromProto(list.type(), ext_set));
+      ARROW_ASSIGN_OR_RAISE(auto type_nullable,
+                            FromProto(list.type(), ext_set, conversion_options));
       return FromProtoImpl<ListType>(
           list, field("item", std::move(type_nullable.first), type_nullable.second));
     }
@@ -192,8 +192,10 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(
                                missing, " type in ", map.DebugString());
       }
 
-      ARROW_ASSIGN_OR_RAISE(auto key_nullable, FromProto(map.key(), ext_set));
-      ARROW_ASSIGN_OR_RAISE(auto value_nullable, FromProto(map.value(), ext_set));
+      ARROW_ASSIGN_OR_RAISE(auto key_nullable,
+                            FromProto(map.key(), ext_set, conversion_options));
+      ARROW_ASSIGN_OR_RAISE(auto value_nullable,
+                            FromProto(map.value(), ext_set, conversion_options));
 
       if (key_nullable.second) {
         return Status::Invalid(
@@ -206,10 +208,11 @@ Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(
           field("value", std::move(value_nullable.first), value_nullable.second));
     }
 
-    case substrait::Type::kUserDefinedTypeReference: {
-      uint32_t anchor = type.user_defined_type_reference();
+    case substrait::Type::kUserDefined: {
+      const auto& user_defined = type.user_defined();
+      uint32_t anchor = user_defined.type_reference();
       ARROW_ASSIGN_OR_RAISE(auto type_record, ext_set.DecodeType(anchor));
-      return std::make_pair(std::move(type_record.type), true);
+      return std::make_pair(std::move(type_record.type), IsNullable(user_defined));
     }
 
     default:
@@ -260,6 +263,8 @@ struct DataTypeToProtoImpl {
     return SetWith(&substrait::Type::set_allocated_binary);
   }
 
+  Status Visit(const BinaryViewType& t) { return NotImplemented(t); }
+
   Status Visit(const FixedSizeBinaryType& t) {
     SetWithThen(&substrait::Type::set_allocated_fixed_binary)->set_length(t.byte_width());
     return Status::OK();
@@ -302,11 +307,15 @@ struct DataTypeToProtoImpl {
 
   Status Visit(const ListType& t) {
     // FIXME assert default field name; custom ones won't roundtrip
-    ARROW_ASSIGN_OR_RAISE(
-        auto type, ToProto(*t.value_type(), t.value_field()->nullable(), ext_set_));
+    ARROW_ASSIGN_OR_RAISE(auto type, ToProto(*t.value_type(), t.value_field()->nullable(),
+                                             ext_set_, conversion_options_));
     SetWithThen(&substrait::Type::set_allocated_list)->set_allocated_type(type.release());
     return Status::OK();
   }
+
+  Status Visit(const ListViewType& t) { return NotImplemented(t); }
+
+  Status Visit(const LargeListViewType& t) { return NotImplemented(t); }
 
   Status Visit(const StructType& t) {
     auto types = SetWithThen(&substrait::Type::set_allocated_struct_)->mutable_types();
@@ -317,8 +326,8 @@ struct DataTypeToProtoImpl {
       if (field->metadata() != nullptr) {
         return Status::Invalid("substrait::Type::Struct does not support field metadata");
       }
-      ARROW_ASSIGN_OR_RAISE(auto type,
-                            ToProto(*field->type(), field->nullable(), ext_set_));
+      ARROW_ASSIGN_OR_RAISE(auto type, ToProto(*field->type(), field->nullable(),
+                                               ext_set_, conversion_options_));
       types->AddAllocated(type.release());
     }
     return Status::OK();
@@ -327,16 +336,18 @@ struct DataTypeToProtoImpl {
   Status Visit(const SparseUnionType& t) { return NotImplemented(t); }
   Status Visit(const DenseUnionType& t) { return NotImplemented(t); }
   Status Visit(const DictionaryType& t) { return NotImplemented(t); }
+  Status Visit(const RunEndEncodedType& t) { return NotImplemented(t); }
 
   Status Visit(const MapType& t) {
     // FIXME assert default field names; custom ones won't roundtrip
     auto map = SetWithThen(&substrait::Type::set_allocated_map);
 
-    ARROW_ASSIGN_OR_RAISE(auto key, ToProto(*t.key_type(), /*nullable=*/false, ext_set_));
+    ARROW_ASSIGN_OR_RAISE(auto key, ToProto(*t.key_type(), /*nullable=*/false, ext_set_,
+                                            conversion_options_));
     map->set_allocated_key(key.release());
 
-    ARROW_ASSIGN_OR_RAISE(auto value,
-                          ToProto(*t.item_type(), t.item_field()->nullable(), ext_set_));
+    ARROW_ASSIGN_OR_RAISE(auto value, ToProto(*t.item_type(), t.item_field()->nullable(),
+                                              ext_set_, conversion_options_));
     map->set_allocated_value(value.release());
 
     return Status::OK();
@@ -377,7 +388,7 @@ struct DataTypeToProtoImpl {
 
   template <typename Sub>
   Sub* SetWithThen(void (substrait::Type::*set_allocated_sub)(Sub*)) {
-    auto sub = internal::make_unique<Sub>();
+    auto sub = std::make_unique<Sub>();
     sub->set_nullability(nullable_ ? substrait::Type::NULLABILITY_NULLABLE
                                    : substrait::Type::NULLABILITY_REQUIRED);
 
@@ -394,7 +405,11 @@ struct DataTypeToProtoImpl {
   template <typename T>
   Status EncodeUserDefined(const T& t) {
     ARROW_ASSIGN_OR_RAISE(auto anchor, ext_set_->EncodeType(t));
-    type_->set_user_defined_type_reference(anchor);
+    auto user_defined = std::make_unique<substrait::Type::UserDefined>();
+    user_defined->set_type_reference(anchor);
+    user_defined->set_nullability(nullable_ ? substrait::Type::NULLABILITY_NULLABLE
+                                            : substrait::Type::NULLABILITY_REQUIRED);
+    type_->set_allocated_user_defined(user_defined.release());
     return Status::OK();
   }
 
@@ -407,25 +422,28 @@ struct DataTypeToProtoImpl {
   substrait::Type* type_;
   bool nullable_;
   ExtensionSet* ext_set_;
+  const ConversionOptions& conversion_options_;
 };
 }  // namespace
 
-Result<std::unique_ptr<substrait::Type>> ToProto(const DataType& type, bool nullable,
-                                                 ExtensionSet* ext_set) {
-  auto out = internal::make_unique<substrait::Type>();
-  RETURN_NOT_OK((DataTypeToProtoImpl{out.get(), nullable, ext_set})(type));
+Result<std::unique_ptr<substrait::Type>> ToProto(
+    const DataType& type, bool nullable, ExtensionSet* ext_set,
+    const ConversionOptions& conversion_options) {
+  auto out = std::make_unique<substrait::Type>();
+  RETURN_NOT_OK(
+      (DataTypeToProtoImpl{out.get(), nullable, ext_set, conversion_options})(type));
   return std::move(out);
 }
 
 Result<std::shared_ptr<Schema>> FromProto(const substrait::NamedStruct& named_struct,
-                                          const ExtensionSet& ext_set) {
+                                          const ExtensionSet& ext_set,
+                                          const ConversionOptions& conversion_options) {
   if (!named_struct.has_struct_()) {
     return Status::Invalid("While converting ", named_struct.DebugString(),
                            " no anonymous struct type was provided to which names "
                            "could be attached.");
   }
   const auto& struct_ = named_struct.struct_();
-  RETURN_NOT_OK(CheckVariation(struct_));
 
   int requested_names_count = 0;
   ARROW_ASSIGN_OR_RAISE(auto fields, FieldsFromProto(
@@ -437,7 +455,7 @@ Result<std::shared_ptr<Schema>> FromProto(const substrait::NamedStruct& named_st
                                                       ? named_struct.names().Get(i)
                                                       : "";
                                          },
-                                         ext_set));
+                                         ext_set, conversion_options));
 
   if (requested_names_count != named_struct.names_size()) {
     return Status::Invalid("While converting ", named_struct.DebugString(), " received ",
@@ -461,28 +479,32 @@ void ToProtoGetDepthFirstNames(const FieldVector& fields,
 }
 }  // namespace
 
-Result<std::unique_ptr<substrait::NamedStruct>> ToProto(const Schema& schema,
-                                                        ExtensionSet* ext_set) {
-  if (schema.metadata()) {
+Result<std::unique_ptr<substrait::NamedStruct>> ToProto(
+    const Schema& schema, ExtensionSet* ext_set,
+    const ConversionOptions& conversion_options) {
+  if (conversion_options.strictness == ConversionStrictness::EXACT_ROUNDTRIP &&
+      schema.metadata() != nullptr) {
     return Status::Invalid("substrait::NamedStruct does not support schema metadata");
   }
 
-  auto named_struct = internal::make_unique<substrait::NamedStruct>();
+  auto named_struct = std::make_unique<substrait::NamedStruct>();
 
   auto names = named_struct->mutable_names();
   names->Reserve(schema.num_fields());
   ToProtoGetDepthFirstNames(schema.fields(), names);
 
-  auto struct_ = internal::make_unique<substrait::Type::Struct>();
+  auto struct_ = std::make_unique<substrait::Type::Struct>();
   auto types = struct_->mutable_types();
   types->Reserve(schema.num_fields());
 
   for (const auto& field : schema.fields()) {
-    if (field->metadata() != nullptr) {
+    if (conversion_options.strictness == ConversionStrictness::EXACT_ROUNDTRIP &&
+        field->metadata() != nullptr) {
       return Status::Invalid("substrait::NamedStruct does not support field metadata");
     }
 
-    ARROW_ASSIGN_OR_RAISE(auto type, ToProto(*field->type(), field->nullable(), ext_set));
+    ARROW_ASSIGN_OR_RAISE(auto type, ToProto(*field->type(), field->nullable(), ext_set,
+                                             conversion_options));
     types->AddAllocated(type.release());
   }
 

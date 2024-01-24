@@ -19,9 +19,9 @@ package pqarrow
 import (
 	"context"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet/internal/encoding"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet/internal/encoding"
 )
 
 // ArrowWriterProperties are used to determine how to manipulate the arrow data
@@ -166,6 +166,28 @@ type ArrowReadProperties struct {
 	// BatchSize is the size used for calls to NextBatch when reading whole columns
 	BatchSize int64
 
-	readDict  map[int]bool
-	preBuffer bool
+	readDictIndices map[int]struct{}
+}
+
+// SetReadDict determines whether to read a particular column as dictionary
+// encoded or not.
+func (props *ArrowReadProperties) SetReadDict(colIdx int, readDict bool) {
+	if props.readDictIndices == nil {
+		props.readDictIndices = make(map[int]struct{})
+	}
+
+	if readDict {
+		props.readDictIndices[colIdx] = struct{}{}
+	} else {
+		delete(props.readDictIndices, colIdx)
+	}
+}
+
+func (props *ArrowReadProperties) ReadDict(colIdx int) bool {
+	if props.readDictIndices == nil {
+		return false
+	}
+
+	_, ok := props.readDictIndices[colIdx]
+	return ok
 }

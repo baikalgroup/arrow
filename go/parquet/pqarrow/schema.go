@@ -18,17 +18,19 @@ package pqarrow
 
 import (
 	"encoding/base64"
+	"fmt"
 	"math"
 	"strconv"
-	"strings"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/flight"
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/apache/arrow/go/v8/parquet/metadata"
-	"github.com/apache/arrow/go/v8/parquet/schema"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/decimal128"
+	"github.com/apache/arrow/go/v15/arrow/flight"
+	"github.com/apache/arrow/go/v15/arrow/ipc"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/metadata"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"golang.org/x/xerrors"
 )
 
@@ -64,7 +66,7 @@ func (sm *SchemaManifest) GetColumnField(index int) (*SchemaField, error) {
 	if field, ok := sm.ColIndexToField[index]; ok {
 		return field, nil
 	}
-	return nil, xerrors.Errorf("Column Index %d not found in schema manifest", index)
+	return nil, fmt.Errorf("Column Index %d not found in schema manifest", index)
 }
 
 // GetParent gets the parent field for a given field if it is a nested column, otherwise
@@ -101,13 +103,13 @@ func (sm *SchemaManifest) GetFieldIndices(indices []int) ([]int, error) {
 
 	for _, idx := range indices {
 		if idx < 0 || idx >= sm.descr.NumColumns() {
-			return nil, xerrors.Errorf("column index %d is not valid", idx)
+			return nil, fmt.Errorf("column index %d is not valid", idx)
 		}
 
 		fieldNode := sm.descr.ColumnRoot(idx)
 		fieldIdx := sm.descr.Root().FieldIndexByField(fieldNode)
 		if fieldIdx == -1 {
-			return nil, xerrors.Errorf("column index %d is not valid", idx)
+			return nil, fmt.Errorf("column index %d is not valid", idx)
 		}
 
 		if _, ok := added[fieldIdx]; !ok {
@@ -116,6 +118,10 @@ func (sm *SchemaManifest) GetFieldIndices(indices []int) ([]int, error) {
 		}
 	}
 	return ret, nil
+}
+
+func isDictionaryReadSupported(dt arrow.DataType) bool {
+	return arrow.IsBinaryLike(dt.ID())
 }
 
 func arrowTimestampToLogical(typ *arrow.TimestampType, unit arrow.TimeUnit) schema.LogicalType {
@@ -165,10 +171,10 @@ func getTimestampMeta(typ *arrow.TimestampType, props *parquet.WriterProperties,
 			switch target {
 			case arrow.Millisecond, arrow.Microsecond:
 			case arrow.Nanosecond, arrow.Second:
-				return physical, nil, xerrors.Errorf("parquet version %s files can only coerce arrow timestamps to millis or micros", props.Version())
+				return physical, nil, fmt.Errorf("parquet version %s files can only coerce arrow timestamps to millis or micros", props.Version())
 			}
 		} else if target == arrow.Second {
-			return physical, nil, xerrors.Errorf("parquet version %s files can only coerce arrow timestampts to millis, micros or nanos", props.Version())
+			return physical, nil, fmt.Errorf("parquet version %s files can only coerce arrow timestamps to millis, micros or nanos", props.Version())
 		}
 		return physical, logicalType, nil
 	}
@@ -227,11 +233,11 @@ func repFromNullable(isnullable bool) parquet.Repetition {
 }
 
 func structToNode(typ *arrow.StructType, name string, nullable bool, props *parquet.WriterProperties, arrprops ArrowWriterProperties) (schema.Node, error) {
-	if len(typ.Fields()) == 0 {
-		return nil, xerrors.Errorf("cannot write struct type '%s' with no children field to parquet. Consider adding a dummy child", name)
+	if typ.NumFields() == 0 {
+		return nil, fmt.Errorf("cannot write struct type '%s' with no children field to parquet. Consider adding a dummy child", name)
 	}
 
-	children := make(schema.FieldList, 0, len(typ.Fields()))
+	children := make(schema.FieldList, 0, typ.NumFields())
 	for _, f := range typ.Fields() {
 		n, err := fieldToNode(f.Name, f, props, arrprops)
 		if err != nil {
@@ -291,20 +297,30 @@ func fieldToNode(name string, field arrow.Field, props *parquet.WriterProperties
 		typ = parquet.Types.Float
 	case arrow.FLOAT64:
 		typ = parquet.Types.Double
-	case arrow.STRING:
+	case arrow.STRING, arrow.LARGE_STRING:
 		logicalType = schema.StringLogicalType{}
 		fallthrough
-	case arrow.BINARY:
+	case arrow.BINARY, arrow.LARGE_BINARY:
 		typ = parquet.Types.ByteArray
 	case arrow.FIXED_SIZE_BINARY:
 		typ = parquet.Types.FixedLenByteArray
 		length = field.Type.(*arrow.FixedSizeBinaryType).ByteWidth
-	case arrow.DECIMAL:
-		typ = parquet.Types.FixedLenByteArray
-		dectype := field.Type.(*arrow.Decimal128Type)
-		precision = int(dectype.Precision)
-		scale = int(dectype.Scale)
-		length = int(DecimalSize(int32(precision)))
+	case arrow.DECIMAL, arrow.DECIMAL256:
+		dectype := field.Type.(arrow.DecimalType)
+		precision = int(dectype.GetPrecision())
+		scale = int(dectype.GetScale())
+
+		if props.StoreDecimalAsInteger() && 1 <= precision && precision <= 18 {
+			if precision <= 9 {
+				typ = parquet.Types.Int32
+			} else {
+				typ = parquet.Types.Int64
+			}
+		} else {
+			typ = parquet.Types.FixedLenByteArray
+			length = int(DecimalSize(int32(precision)))
+		}
+
 		logicalType = schema.NewDecimalLogicalType(int32(precision), int32(scale))
 	case arrow.DATE32:
 		typ = parquet.Types.Int32
@@ -328,6 +344,10 @@ func fieldToNode(name string, field arrow.Field, props *parquet.WriterProperties
 		} else {
 			logicalType = schema.NewTimeLogicalType(true, schema.TimeUnitMicros)
 		}
+	case arrow.FLOAT16:
+		typ = parquet.Types.FixedLenByteArray
+		length = arrow.Float16SizeBytes
+		logicalType = schema.Float16LogicalType{}
 	case arrow.STRUCT:
 		return structToNode(field.Type.(*arrow.StructType), field.Name, field.Nullable, props, arrprops)
 	case arrow.FIXED_SIZE_LIST, arrow.LIST:
@@ -346,9 +366,19 @@ func fieldToNode(name string, field arrow.Field, props *parquet.WriterProperties
 		return schema.ListOf(child, repFromNullable(field.Nullable), -1)
 	case arrow.DICTIONARY:
 		// parquet has no dictionary type, dictionary is encoding, not schema level
-		return nil, xerrors.New("not implemented yet")
+		dictType := field.Type.(*arrow.DictionaryType)
+		return fieldToNode(name, arrow.Field{Name: name, Type: dictType.ValueType, Nullable: field.Nullable, Metadata: field.Metadata},
+			props, arrprops)
 	case arrow.EXTENSION:
-		return nil, xerrors.New("not implemented yet")
+		return fieldToNode(name, arrow.Field{
+			Name:     name,
+			Type:     field.Type.(arrow.ExtensionType).StorageType(),
+			Nullable: field.Nullable,
+			Metadata: arrow.MetadataFrom(map[string]string{
+				ipc.ExtensionTypeKeyName:     field.Type.(arrow.ExtensionType).ExtensionName(),
+				ipc.ExtensionMetadataKeyName: field.Type.(arrow.ExtensionType).Serialize(),
+			}),
+		}, props, arrprops)
 	case arrow.MAP:
 		mapType := field.Type.(*arrow.MapType)
 		keyNode, err := fieldToNode("key", mapType.KeyField(), props, arrprops)
@@ -373,7 +403,7 @@ func fieldToNode(name string, field arrow.Field, props *parquet.WriterProperties
 		}
 		return schema.MapOf(field.Name, keyNode, valueNode, repFromNullable(field.Nullable), -1)
 	default:
-		return nil, xerrors.New("not implemented yet")
+		return nil, fmt.Errorf("%w: support for %s", arrow.ErrNotImplemented, field.Type.ID())
 	}
 
 	return schema.NewPrimitiveNodeLogical(name, repType, logicalType, typ, length, fieldIDFromMeta(field.Metadata))
@@ -410,7 +440,7 @@ func ToParquet(sc *arrow.Schema, props *parquet.WriterProperties, arrprops Arrow
 		props = parquet.NewWriterProperties()
 	}
 
-	nodes := make(schema.FieldList, 0, len(sc.Fields()))
+	nodes := make(schema.FieldList, 0, sc.NumFields())
 	for _, f := range sc.Fields() {
 		n, err := fieldToNode(f.Name, f, props, arrprops)
 		if err != nil {
@@ -419,7 +449,11 @@ func ToParquet(sc *arrow.Schema, props *parquet.WriterProperties, arrprops Arrow
 		nodes = append(nodes, n)
 	}
 
-	root, err := schema.NewGroupNode("schema", parquet.Repetitions.Repeated, nodes, -1)
+	root, err := schema.NewGroupNode(props.RootName(), props.RootRepetition(), nodes, -1)
+	if err != nil {
+		return nil, err
+	}
+
 	return schema.NewSchema(root), err
 }
 
@@ -502,6 +536,13 @@ func arrowTimestamp(logical *schema.TimestampLogicalType) (arrow.DataType, error
 	}
 }
 
+func arrowDecimal(logical *schema.DecimalLogicalType) arrow.DataType {
+	if logical.Precision() <= decimal128.MaxPrecision {
+		return &arrow.Decimal128Type{Precision: logical.Precision(), Scale: logical.Scale()}
+	}
+	return &arrow.Decimal256Type{Precision: logical.Precision(), Scale: logical.Scale()}
+}
+
 func arrowFromInt32(logical schema.LogicalType) (arrow.DataType, error) {
 	switch logtype := logical.(type) {
 	case schema.NoLogicalType:
@@ -509,7 +550,7 @@ func arrowFromInt32(logical schema.LogicalType) (arrow.DataType, error) {
 	case *schema.TimeLogicalType:
 		return arrowTime32(logtype)
 	case *schema.DecimalLogicalType:
-		return &arrow.Decimal128Type{Precision: logtype.Precision(), Scale: logtype.Scale()}, nil
+		return arrowDecimal(logtype), nil
 	case *schema.IntLogicalType:
 		return arrowInt(logtype)
 	case schema.DateLogicalType:
@@ -528,7 +569,7 @@ func arrowFromInt64(logical schema.LogicalType) (arrow.DataType, error) {
 	case *schema.IntLogicalType:
 		return arrowInt(logtype)
 	case *schema.DecimalLogicalType:
-		return &arrow.Decimal128Type{Precision: logtype.Precision(), Scale: logtype.Scale()}, nil
+		return arrowDecimal(logtype), nil
 	case *schema.TimeLogicalType:
 		return arrowTime64(logtype)
 	case *schema.TimestampLogicalType:
@@ -543,7 +584,7 @@ func arrowFromByteArray(logical schema.LogicalType) (arrow.DataType, error) {
 	case schema.StringLogicalType:
 		return arrow.BinaryTypes.String, nil
 	case *schema.DecimalLogicalType:
-		return &arrow.Decimal128Type{Precision: logtype.Precision(), Scale: logtype.Scale()}, nil
+		return arrowDecimal(logtype), nil
 	case schema.NoLogicalType,
 		schema.EnumLogicalType,
 		schema.JSONLogicalType,
@@ -557,9 +598,11 @@ func arrowFromByteArray(logical schema.LogicalType) (arrow.DataType, error) {
 func arrowFromFLBA(logical schema.LogicalType, length int) (arrow.DataType, error) {
 	switch logtype := logical.(type) {
 	case *schema.DecimalLogicalType:
-		return &arrow.Decimal128Type{Precision: logtype.Precision(), Scale: logtype.Scale()}, nil
+		return arrowDecimal(logtype), nil
 	case schema.NoLogicalType, schema.IntervalLogicalType, schema.UUIDLogicalType:
 		return &arrow.FixedSizeBinaryType{ByteWidth: int(length)}, nil
+	case schema.Float16LogicalType:
+		return &arrow.Float16Type{}, nil
 	default:
 		return nil, xerrors.New("unhandled logical type " + logical.String() + " for fixed-length byte array")
 	}
@@ -648,13 +691,13 @@ func listToSchemaField(n *schema.GroupNode, currentLevels file.LevelInfo, ctx *s
 		//   If the name is array or ends in _tuple, this should be a list of struct
 		//   even for single child elements.
 		listGroup := listNode.(*schema.GroupNode)
-		if listGroup.NumFields() == 1 && (listGroup.Name() == "array" || strings.HasSuffix(listGroup.Name(), "_tuple")) {
+		if listGroup.NumFields() == 1 && !(listGroup.Name() == "array" || listGroup.Name() == (n.Name()+"_tuple")) {
 			// list of primitive type
-			if err := groupToStructField(listGroup, currentLevels, ctx, out, &out.Children[0]); err != nil {
+			if err := nodeToSchemaField(listGroup.Field(0), currentLevels, ctx, out, &out.Children[0]); err != nil {
 				return err
 			}
 		} else {
-			if err := nodeToSchemaField(listGroup.Field(0), currentLevels, ctx, out, &out.Children[0]); err != nil {
+			if err := groupToStructField(listGroup, currentLevels, ctx, out, &out.Children[0]); err != nil {
 				return err
 			}
 		}
@@ -671,12 +714,18 @@ func listToSchemaField(n *schema.GroupNode, currentLevels file.LevelInfo, ctx *s
 			return err
 		}
 
+		if ctx.props.ReadDict(colIndex) && isDictionaryReadSupported(arrowType) {
+			arrowType = &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: arrowType}
+		}
+
 		itemField := arrow.Field{Name: listNode.Name(), Type: arrowType, Nullable: false, Metadata: createFieldMeta(int(listNode.FieldID()))}
 		populateLeaf(colIndex, &itemField, currentLevels, ctx, out, &out.Children[0])
 	}
 
-	out.Field = &arrow.Field{Name: n.Name(), Type: arrow.ListOf(out.Children[0].Field.Type),
+	out.Field = &arrow.Field{Name: n.Name(), Type: arrow.ListOfField(
+		arrow.Field{Name: listNode.Name(), Type: out.Children[0].Field.Type, Nullable: true}),
 		Nullable: n.RepetitionType() == parquet.Repetitions.Optional, Metadata: createFieldMeta(int(n.FieldID()))}
+
 	out.LevelInfo = currentLevels
 	// At this point current levels contains the def level for this list,
 	// we need to reset to the prior parent.
@@ -720,7 +769,7 @@ func mapToSchemaField(n *schema.GroupNode, currentLevels file.LevelInfo, ctx *sc
 
 	kvgroup := keyvalueNode.(*schema.GroupNode)
 	if kvgroup.NumFields() != 1 && kvgroup.NumFields() != 2 {
-		return xerrors.Errorf("keyvalue node group must have exactly 1 or 2 child elements, Found %d", kvgroup.NumFields())
+		return fmt.Errorf("keyvalue node group must have exactly 1 or 2 child elements, Found %d", kvgroup.NumFields())
 	}
 
 	keyNode := kvgroup.Field(0)
@@ -839,6 +888,10 @@ func nodeToSchemaField(n schema.Node, currentLevels file.LevelInfo, ctx *schemaT
 		return err
 	}
 
+	if ctx.props.ReadDict(colIndex) && isDictionaryReadSupported(arrowType) {
+		arrowType = &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32, ValueType: arrowType}
+	}
+
 	if primitive.RepetitionType() == parquet.Repetitions.Repeated {
 		// one-level list encoding e.g. a: repeated int32;
 		repeatedAncestorDefLevel := currentLevels.IncrementRepeated()
@@ -871,7 +924,22 @@ func getOriginSchema(meta metadata.KeyValueMetadata, mem memory.Allocator) (*arr
 		return nil, nil
 	}
 
-	decoded, err := base64.RawStdEncoding.DecodeString(*serialized)
+	var (
+		decoded []byte
+		err     error
+	)
+
+	// if the length of serialized is not a multiple of 4, it cannot be
+	// padded with std encoding.
+	if len(*serialized)%4 == 0 {
+		decoded, err = base64.StdEncoding.DecodeString(*serialized)
+	}
+	// if we failed to decode it with stdencoding or the length wasn't
+	// a multiple of 4, try using the Raw unpadded encoding
+	if len(decoded) == 0 || err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(*serialized)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -913,11 +981,28 @@ func getNestedFactory(origin, inferred arrow.DataType) func(fieldList []arrow.Fi
 func applyOriginalStorageMetadata(origin arrow.Field, inferred *SchemaField) (modified bool, err error) {
 	nchildren := len(inferred.Children)
 	switch origin.Type.ID() {
-	case arrow.EXTENSION, arrow.SPARSE_UNION, arrow.DENSE_UNION, arrow.DICTIONARY:
+	case arrow.EXTENSION:
+		extType := origin.Type.(arrow.ExtensionType)
+		modified, err = applyOriginalStorageMetadata(arrow.Field{
+			Type:     extType.StorageType(),
+			Metadata: origin.Metadata,
+		}, inferred)
+		if err != nil {
+			return
+		}
+
+		if !arrow.TypeEqual(extType.StorageType(), inferred.Field.Type) {
+			return modified, fmt.Errorf("%w: mismatch storage type '%s' for extension type '%s'",
+				arrow.ErrInvalid, inferred.Field.Type, extType)
+		}
+
+		inferred.Field.Type = extType
+		modified = true
+	case arrow.SPARSE_UNION, arrow.DENSE_UNION:
 		err = xerrors.New("unimplemented type")
 	case arrow.STRUCT:
 		typ := origin.Type.(*arrow.StructType)
-		if nchildren != len(typ.Fields()) {
+		if nchildren != typ.NumFields() {
 			return
 		}
 
@@ -941,7 +1026,7 @@ func applyOriginalStorageMetadata(origin arrow.Field, inferred *SchemaField) (mo
 			}
 			inferred.Field.Type = factory(modifiedChildren)
 		}
-	case arrow.FIXED_SIZE_LIST, arrow.LIST, arrow.MAP:
+	case arrow.FIXED_SIZE_LIST, arrow.LIST, arrow.LARGE_LIST, arrow.MAP: // arrow.ListLike
 		if nchildren != 1 {
 			return
 		}
@@ -951,17 +1036,9 @@ func applyOriginalStorageMetadata(origin arrow.Field, inferred *SchemaField) (mo
 		}
 
 		modified = origin.Type.ID() != inferred.Field.Type.ID()
-		var childModified bool
-		switch typ := origin.Type.(type) {
-		case *arrow.FixedSizeListType:
-			childModified, err = applyOriginalMetadata(arrow.Field{Type: typ.Elem()}, &inferred.Children[0])
-		case *arrow.ListType:
-			childModified, err = applyOriginalMetadata(arrow.Field{Type: typ.Elem()}, &inferred.Children[0])
-		case *arrow.MapType:
-			childModified, err = applyOriginalMetadata(arrow.Field{Type: typ.ValueType()}, &inferred.Children[0])
-		}
+		childModified, err := applyOriginalMetadata(arrow.Field{Type: origin.Type.(arrow.ListLikeType).Elem()}, &inferred.Children[0])
 		if err != nil {
-			return
+			return modified, err
 		}
 		modified = modified || childModified
 		if modified {
@@ -981,6 +1058,25 @@ func applyOriginalStorageMetadata(origin arrow.Field, inferred *SchemaField) (mo
 			inferred.Field.Type = origin.Type
 		}
 		modified = true
+	case arrow.LARGE_STRING, arrow.LARGE_BINARY:
+		inferred.Field.Type = origin.Type
+		modified = true
+	case arrow.DICTIONARY:
+		if origin.Type.ID() != arrow.DICTIONARY || (inferred.Field.Type.ID() == arrow.DICTIONARY || !isDictionaryReadSupported(inferred.Field.Type)) {
+			return
+		}
+
+		// direct dictionary reads are only supported for a few primitive types
+		// so no need to recurse on value types
+		dictOriginType := origin.Type.(*arrow.DictionaryType)
+		inferred.Field.Type = &arrow.DictionaryType{IndexType: arrow.PrimitiveTypes.Int32,
+			ValueType: inferred.Field.Type, Ordered: dictOriginType.Ordered}
+		modified = true
+	case arrow.DECIMAL256:
+		if inferred.Field.Type.ID() == arrow.DECIMAL128 {
+			inferred.Field.Type = origin.Type
+			modified = true
+		}
 	}
 
 	if origin.HasMetadata() {
@@ -1004,10 +1100,6 @@ func applyOriginalStorageMetadata(origin arrow.Field, inferred *SchemaField) (mo
 }
 
 func applyOriginalMetadata(origin arrow.Field, inferred *SchemaField) (bool, error) {
-	if origin.Type.ID() == arrow.EXTENSION {
-		return false, xerrors.New("extension types not implemented yet")
-	}
-
 	return applyOriginalStorageMetadata(origin, inferred)
 }
 
@@ -1024,6 +1116,9 @@ func NewSchemaManifest(sc *schema.Schema, meta metadata.KeyValueMetadata, props 
 		Fields:          make([]SchemaField, sc.Root().NumFields()),
 	}
 	ctx.props = props
+	if ctx.props == nil {
+		ctx.props = &ArrowReadProperties{}
+	}
 	ctx.schema = sc
 
 	var err error

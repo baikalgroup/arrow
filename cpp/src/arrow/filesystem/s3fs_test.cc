@@ -58,7 +58,7 @@
 #include "arrow/status.h"
 #include "arrow/testing/future_util.h"
 #include "arrow/testing/gtest_util.h"
-#include "arrow/testing/util.h"
+#include "arrow/testing/matchers.h"
 #include "arrow/util/async_generator.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/future.h"
@@ -66,13 +66,17 @@
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/macros.h"
+#include "arrow/util/range.h"
+#include "arrow/util/string.h"
 
 namespace arrow {
 namespace fs {
 
 using ::arrow::internal::checked_pointer_cast;
 using ::arrow::internal::PlatformFilename;
+using ::arrow::internal::ToChars;
 using ::arrow::internal::UriEscape;
+using ::arrow::internal::Zip;
 
 using ::arrow::fs::internal::ConnectRetryStrategy;
 using ::arrow::fs::internal::ErrorToStatus;
@@ -100,12 +104,16 @@ class ShortRetryStrategy : public S3RetryStrategy {
       // which would trigger spurious retries.
       return false;
     }
-    return error.should_retry && (attempted_retries * kRetryInterval < kMaxRetryDuration);
+    return IsRetryable(error) && (attempted_retries * kRetryInterval < kMaxRetryDuration);
   }
 
   int64_t CalculateDelayBeforeNextRetry(const AWSErrorDetail& error,
                                         int64_t attempted_retries) override {
     return kRetryInterval;
+  }
+
+  bool IsRetryable(const AWSErrorDetail& error) const {
+    return error.should_retry || error.exception_name == "XMinioServerNotInitialized";
   }
 
 #ifdef _WIN32
@@ -141,11 +149,6 @@ class ShortRetryStrategy : public S3RetryStrategy {
 
 class AwsTestMixin : public ::testing::Test {
  public:
-  // We set this environment variable to speed up tests by ensuring
-  // DefaultAWSCredentialsProviderChain does not query (inaccessible)
-  // EC2 metadata endpoint
-  AwsTestMixin() : ec2_metadata_disabled_guard_("AWS_EC2_METADATA_DISABLED", "true") {}
-
   void SetUp() override {
 #ifdef AWS_CPP_SDK_S3_NOT_SHARED
     auto aws_log_level = Aws::Utils::Logging::LogLevel::Fatal;
@@ -164,7 +167,6 @@ class AwsTestMixin : public ::testing::Test {
   }
 
  private:
-  EnvVarGuard ec2_metadata_disabled_guard_;
 #ifdef AWS_CPP_SDK_S3_NOT_SHARED
   Aws::SDKOptions aws_options_;
 #endif
@@ -175,8 +177,27 @@ class S3TestMixin : public AwsTestMixin {
   void SetUp() override {
     AwsTestMixin::SetUp();
 
-    ASSERT_OK_AND_ASSIGN(minio_, GetMinioEnv()->GetOneServer());
+    // Starting the server may fail, for example if the generated port number
+    // was "stolen" by another process. Run a dummy S3 operation to make sure it
+    // is running, otherwise retry a number of times.
+    Status connect_status;
+    int retries = kNumServerRetries;
+    do {
+      ASSERT_OK(InitServerAndClient());
+      connect_status = OutcomeToStatus("ListBuckets", client_->ListBuckets());
+    } while (!connect_status.ok() && --retries > 0);
+    ASSERT_OK(connect_status);
+  }
 
+  void TearDown() override {
+    client_.reset();  // Aws::S3::S3Client destruction relies on AWS SDK, so it must be
+                      // reset before Aws::ShutdownAPI
+    AwsTestMixin::TearDown();
+  }
+
+ protected:
+  Status InitServerAndClient() {
+    ARROW_ASSIGN_OR_RAISE(minio_, GetMinioEnv()->GetOneServer());
     client_config_.reset(new Aws::Client::ClientConfiguration());
     client_config_->endpointOverride = ToAwsString(minio_->connect_string());
     client_config_->scheme = Aws::Http::Scheme::HTTP;
@@ -188,11 +209,12 @@ class S3TestMixin : public AwsTestMixin {
         new Aws::S3::S3Client(credentials_, *client_config_,
                               Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
                               use_virtual_addressing));
+    return Status::OK();
   }
 
-  void TearDown() override { AwsTestMixin::TearDown(); }
+  // How many times to try launching a server in a row before decreeing failure
+  static constexpr int kNumServerRetries = 3;
 
- protected:
   std::shared_ptr<MinioTestServer> minio_;
   std::unique_ptr<Aws::Client::ClientConfiguration> client_config_;
   Aws::Auth::AWSCredentials credentials_;
@@ -279,6 +301,13 @@ TEST_F(S3OptionsTest, FromUri) {
 
   // Invalid option
   ASSERT_RAISES(Invalid, S3Options::FromUri("s3://mybucket/?xxx=zzz", &path));
+
+  // Endpoint from environment variable
+  {
+    EnvVarGuard endpoint_guard("AWS_ENDPOINT_URL", "http://127.0.0.1:9000");
+    ASSERT_OK_AND_ASSIGN(options, S3Options::FromUri("s3://mybucket/", &path));
+    ASSERT_EQ(options.endpoint_override, "http://127.0.0.1:9000");
+  }
 }
 
 TEST_F(S3OptionsTest, FromAccessKey) {
@@ -318,7 +347,7 @@ TEST_F(S3OptionsTest, FromAssumeRole) {
 class S3RegionResolutionTest : public AwsTestMixin {};
 
 TEST_F(S3RegionResolutionTest, PublicBucket) {
-  ASSERT_OK_AND_EQ("us-east-2", ResolveS3BucketRegion("ursa-labs-taxi-data"));
+  ASSERT_OK_AND_EQ("us-east-2", ResolveS3BucketRegion("voltrondata-labs-datasets"));
 
   // Taken from a registry of open S3-hosted datasets
   // at https://github.com/awslabs/open-data-registry
@@ -336,10 +365,10 @@ TEST_F(S3RegionResolutionTest, RestrictedBucket) {
 }
 
 TEST_F(S3RegionResolutionTest, NonExistentBucket) {
-  auto maybe_region = ResolveS3BucketRegion("ursa-labs-non-existent-bucket");
+  auto maybe_region = ResolveS3BucketRegion("ursa-labs-nonexistent-bucket");
   ASSERT_RAISES(IOError, maybe_region);
   ASSERT_THAT(maybe_region.status().message(),
-              ::testing::HasSubstr("Bucket 'ursa-labs-non-existent-bucket' not found"));
+              ::testing::HasSubstr("Bucket 'ursa-labs-nonexistent-bucket' not found"));
 }
 
 TEST_F(S3RegionResolutionTest, InvalidBucketName) {
@@ -401,44 +430,51 @@ class TestS3FS : public S3TestMixin {
  public:
   void SetUp() override {
     S3TestMixin::SetUp();
+    // Most tests will create buckets
+    options_.allow_bucket_creation = true;
+    options_.allow_bucket_deletion = true;
     MakeFileSystem();
     // Set up test bucket
     {
       Aws::S3::Model::CreateBucketRequest req;
       req.SetBucket(ToAwsString("bucket"));
-      ASSERT_OK(OutcomeToStatus(client_->CreateBucket(req)));
+      ASSERT_OK(OutcomeToStatus("CreateBucket", client_->CreateBucket(req)));
       req.SetBucket(ToAwsString("empty-bucket"));
-      ASSERT_OK(OutcomeToStatus(client_->CreateBucket(req)));
+      ASSERT_OK(OutcomeToStatus("CreateBucket", client_->CreateBucket(req)));
     }
     {
       Aws::S3::Model::PutObjectRequest req;
       req.SetBucket(ToAwsString("bucket"));
       req.SetKey(ToAwsString("emptydir/"));
-      ASSERT_OK(OutcomeToStatus(client_->PutObject(req)));
+      req.SetBody(std::make_shared<std::stringstream>(""));
+      ASSERT_OK(OutcomeToStatus("PutObject", client_->PutObject(req)));
       // NOTE: no need to create intermediate "directories" somedir/ and
       // somedir/subdir/
       req.SetKey(ToAwsString("somedir/subdir/subfile"));
       req.SetBody(std::make_shared<std::stringstream>("sub data"));
-      ASSERT_OK(OutcomeToStatus(client_->PutObject(req)));
+      ASSERT_OK(OutcomeToStatus("PutObject", client_->PutObject(req)));
       req.SetKey(ToAwsString("somefile"));
       req.SetBody(std::make_shared<std::stringstream>("some data"));
       req.SetContentType("x-arrow/test");
-      ASSERT_OK(OutcomeToStatus(client_->PutObject(req)));
+      ASSERT_OK(OutcomeToStatus("PutObject", client_->PutObject(req)));
       req.SetKey(ToAwsString("otherdir/1/2/3/otherfile"));
       req.SetBody(std::make_shared<std::stringstream>("other data"));
-      ASSERT_OK(OutcomeToStatus(client_->PutObject(req)));
+      ASSERT_OK(OutcomeToStatus("PutObject", client_->PutObject(req)));
     }
   }
 
-  void MakeFileSystem() {
+  Result<std::shared_ptr<S3FileSystem>> MakeNewFileSystem(
+      io::IOContext io_context = io::default_io_context()) {
     options_.ConfigureAccessKey(minio_->access_key(), minio_->secret_key());
     options_.scheme = "http";
     options_.endpoint_override = minio_->connect_string();
     if (!options_.retry_strategy) {
       options_.retry_strategy = std::make_shared<ShortRetryStrategy>();
     }
-    ASSERT_OK_AND_ASSIGN(fs_, S3FileSystem::Make(options_));
+    return S3FileSystem::Make(options_, io_context);
   }
+
+  void MakeFileSystem() { ASSERT_OK_AND_ASSIGN(fs_, MakeNewFileSystem()); }
 
   template <typename Matcher>
   void AssertMetadataRoundtrip(const std::string& path,
@@ -554,6 +590,21 @@ class TestS3FS : public S3TestMixin {
     AssertObjectContents(client_.get(), "bucket", "somefile", "new data");
   }
 
+  void TestOpenOutputStreamCloseAsyncDestructor() {
+    std::shared_ptr<io::OutputStream> stream;
+    ASSERT_OK_AND_ASSIGN(stream, fs_->OpenOutputStream("bucket/somefile"));
+    ASSERT_OK(stream->Write("new data"));
+    // Destructor implicitly closes stream and completes the multipart upload.
+    // GH-37670: Testing it doesn't matter whether flush is triggered asynchronously
+    // after CloseAsync or synchronously after stream.reset() since we're just
+    // checking that `closeAsyncFut` keeps the stream alive until completion
+    // rather than segfaulting on a dangling stream
+    auto closeAsyncFut = stream->CloseAsync();
+    stream.reset();
+    ASSERT_OK(closeAsyncFut.MoveResult());
+    AssertObjectContents(client_.get(), "bucket", "somefile", "new data");
+  }
+
  protected:
   S3Options options_;
   std::shared_ptr<S3FileSystem> fs_;
@@ -594,13 +645,13 @@ TEST_F(TestS3FS, GetFileInfoObject) {
   // Nonexistent
   AssertFileInfo(fs_.get(), "bucket/emptyd", FileType::NotFound);
   AssertFileInfo(fs_.get(), "bucket/somed", FileType::NotFound);
-  AssertFileInfo(fs_.get(), "non-existent-bucket/somed", FileType::NotFound);
+  AssertFileInfo(fs_.get(), "nonexistent-bucket/somed", FileType::NotFound);
 
   // Trailing slashes
   AssertFileInfo(fs_.get(), "bucket/emptydir/", FileType::Directory, kNoSize);
   AssertFileInfo(fs_.get(), "bucket/somefile/", FileType::File, 9);
   AssertFileInfo(fs_.get(), "bucket/emptyd/", FileType::NotFound);
-  AssertFileInfo(fs_.get(), "non-existent-bucket/somed/", FileType::NotFound);
+  AssertFileInfo(fs_.get(), "nonexistent-bucket/somed/", FileType::NotFound);
 
   // URIs
   ASSERT_RAISES(Invalid, fs_->GetFileInfo("s3:bucket/emptydir"));
@@ -758,6 +809,81 @@ TEST_F(TestS3FS, GetFileInfoGenerator) {
   // Non-root dir case is tested by generic tests
 }
 
+TEST_F(TestS3FS, GetFileInfoGeneratorStress) {
+  // This test is slow because it needs to create a bunch of seed files.  However, it is
+  // the only test that stresses listing and deleting when there are more than 1000 files
+  // and paging is required.
+  constexpr int32_t kNumDirs = 4;
+  constexpr int32_t kNumFilesPerDir = 512;
+  FileInfoVector expected_infos;
+
+  ASSERT_OK(fs_->CreateDir("stress"));
+  for (int32_t i = 0; i < kNumDirs; i++) {
+    const std::string dir_path = "stress/" + ToChars(i);
+    ASSERT_OK(fs_->CreateDir(dir_path));
+    expected_infos.emplace_back(dir_path, FileType::Directory);
+
+    std::vector<Future<>> tasks;
+    for (int32_t j = 0; j < kNumFilesPerDir; j++) {
+      // Create the files in parallel in hopes of speeding up this process as much as
+      // possible
+      const std::string file_name = ToChars(j);
+      const std::string file_path = dir_path + "/" + file_name;
+      expected_infos.emplace_back(file_path, FileType::File);
+      ASSERT_OK_AND_ASSIGN(Future<> task,
+                           ::arrow::internal::GetCpuThreadPool()->Submit(
+                               [fs = fs_, file_name, file_path]() -> Status {
+                                 ARROW_ASSIGN_OR_RAISE(
+                                     std::shared_ptr<io::OutputStream> out_str,
+                                     fs->OpenOutputStream(file_path));
+                                 ARROW_RETURN_NOT_OK(out_str->Write(file_name));
+                                 return out_str->Close();
+                               }));
+      tasks.push_back(std::move(task));
+    }
+    ASSERT_FINISHES_OK(AllFinished(tasks));
+  }
+  SortInfos(&expected_infos);
+
+  FileSelector select;
+  FileInfoVector infos;
+  select.base_dir = "stress";
+  select.recursive = true;
+
+  // 32 is pretty fast, listing is much faster than the create step above
+  constexpr int32_t kNumTasks = 32;
+  for (int i = 0; i < kNumTasks; i++) {
+    CollectFileInfoGenerator(fs_->GetFileInfoGenerator(select), &infos);
+    SortInfos(&infos);
+    // One info for each directory and one info for each file
+    ASSERT_EQ(infos.size(), expected_infos.size());
+    for (const auto&& [info, expected] : Zip(infos, expected_infos)) {
+      AssertFileInfo(info, expected.path(), expected.type());
+    }
+  }
+
+  ASSERT_OK(fs_->DeleteDirContents("stress"));
+
+  CollectFileInfoGenerator(fs_->GetFileInfoGenerator(select), &infos);
+  ASSERT_EQ(infos.size(), 0);
+}
+
+TEST_F(TestS3FS, GetFileInfoGeneratorCancelled) {
+  FileSelector select;
+  FileInfoVector infos;
+  select.base_dir = "bucket";
+  select.recursive = true;
+
+  StopSource stop_source;
+  io::IOContext cancellable_context(stop_source.token());
+  ASSERT_OK_AND_ASSIGN(std::shared_ptr<S3FileSystem> cancellable_fs,
+                       MakeNewFileSystem(cancellable_context));
+  stop_source.RequestStop();
+  FileInfoGenerator generator = cancellable_fs->GetFileInfoGenerator(select);
+  auto file_infos = CollectAsyncGenerator(std::move(generator));
+  ASSERT_FINISHES_AND_RAISES(Cancelled, file_infos);
+}
+
 TEST_F(TestS3FS, CreateDir) {
   FileInfo st;
 
@@ -860,9 +986,11 @@ TEST_F(TestS3FS, DeleteDirContents) {
   select.base_dir = "bucket";
   std::vector<FileInfo> infos;
 
+  ASSERT_OK(fs_->DeleteDirContents("bucket/doesnotexist", /*missing_dir_ok=*/true));
   ASSERT_OK(fs_->DeleteDirContents("bucket/emptydir"));
   ASSERT_OK(fs_->DeleteDirContents("bucket/somedir"));
   ASSERT_RAISES(IOError, fs_->DeleteDirContents("bucket/somefile"));
+  ASSERT_RAISES(IOError, fs_->DeleteDirContents("bucket/doesnotexist"));
   ASSERT_OK_AND_ASSIGN(infos, fs_->GetFileInfo(select));
   ASSERT_EQ(infos.size(), 4);
   SortInfos(&infos);
@@ -929,7 +1057,7 @@ TEST_F(TestS3FS, Move) {
   ASSERT_OK(fs_->Move("bucket/a=2/newfile", "bucket/a=3/newfile"));
 
   // Nonexistent
-  ASSERT_RAISES(IOError, fs_->Move("bucket/non-existent", "bucket/newfile2"));
+  ASSERT_RAISES(IOError, fs_->Move("bucket/nonexistent", "bucket/newfile2"));
   ASSERT_RAISES(IOError, fs_->Move("nonexistent-bucket/somefile", "bucket/newfile2"));
   ASSERT_RAISES(IOError, fs_->Move("bucket/somefile", "nonexistent-bucket/newfile2"));
   AssertFileInfo(fs_.get(), "bucket/newfile2", FileType::NotFound);
@@ -1064,6 +1192,16 @@ TEST_F(TestS3FS, OpenOutputStreamDestructorSyncWrite) {
   TestOpenOutputStreamDestructor();
 }
 
+TEST_F(TestS3FS, OpenOutputStreamAsyncDestructorBackgroundWrites) {
+  TestOpenOutputStreamCloseAsyncDestructor();
+}
+
+TEST_F(TestS3FS, OpenOutputStreamAsyncDestructorSyncWrite) {
+  options_.background_writes = false;
+  MakeFileSystem();
+  TestOpenOutputStreamCloseAsyncDestructor();
+}
+
 TEST_F(TestS3FS, OpenOutputStreamMetadata) {
   std::shared_ptr<io::OutputStream> stream;
 
@@ -1113,8 +1251,39 @@ TEST_F(TestS3FS, FileSystemFromUri) {
   ASSERT_OK_AND_ASSIGN(auto fs, FileSystemFromUri(ss.str(), &path));
   ASSERT_EQ(path, "bucket/somedir/subdir/subfile");
 
+  ASSERT_OK_AND_ASSIGN(path, fs->PathFromUri(ss.str()));
+  ASSERT_EQ(path, "bucket/somedir/subdir/subfile");
+
+  // Incorrect scheme
+  ASSERT_THAT(fs->PathFromUri("file:///@bucket/somedir/subdir/subfile"),
+              Raises(StatusCode::Invalid,
+                     testing::HasSubstr("expected a URI with one of the schemes (s3)")));
+
+  // Not a URI
+  ASSERT_THAT(fs->PathFromUri("/@bucket/somedir/subdir/subfile"),
+              Raises(StatusCode::Invalid, testing::HasSubstr("Expected a URI")));
+
   // Check the filesystem has the right connection parameters
   AssertFileInfo(fs.get(), path, FileType::File, 8);
+}
+
+TEST_F(TestS3FS, NoCreateDeleteBucket) {
+  // Create a bucket to try deleting
+  ASSERT_OK(fs_->CreateDir("test-no-delete"));
+
+  options_.allow_bucket_creation = false;
+  options_.allow_bucket_deletion = false;
+  MakeFileSystem();
+
+  auto maybe_create_dir = fs_->CreateDir("test-no-create");
+  ASSERT_RAISES(IOError, maybe_create_dir);
+  ASSERT_THAT(maybe_create_dir.message(),
+              ::testing::HasSubstr("Bucket 'test-no-create' not found"));
+
+  auto maybe_delete_dir = fs_->DeleteDir("test-no-delete");
+  ASSERT_RAISES(IOError, maybe_delete_dir);
+  ASSERT_THAT(maybe_delete_dir.message(),
+              ::testing::HasSubstr("Would delete bucket 'test-no-delete'"));
 }
 
 // Simple retry strategy that records errors encountered and its emitted retry delays
@@ -1174,7 +1343,7 @@ class TestS3FSGeneric : public S3TestMixin, public GenericFileSystemTest {
     {
       Aws::S3::Model::CreateBucketRequest req;
       req.SetBucket(ToAwsString("s3fs-test-bucket"));
-      ASSERT_OK(OutcomeToStatus(client_->CreateBucket(req)));
+      ASSERT_OK(OutcomeToStatus("CreateBucket", client_->CreateBucket(req)));
     }
 
     options_.ConfigureAccessKey(minio_->access_key(), minio_->secret_key());
@@ -1210,6 +1379,32 @@ class TestS3FSGeneric : public S3TestMixin, public GenericFileSystemTest {
 };
 
 GENERIC_FS_TEST_FUNCTIONS(TestS3FSGeneric);
+
+////////////////////////////////////////////////////////////////////////////
+// S3GlobalOptions::Defaults tests
+
+TEST(S3GlobalOptions, DefaultsLogLevel) {
+  // Verify we get the default value of Fatal
+  ASSERT_EQ(S3LogLevel::Fatal, arrow::fs::S3GlobalOptions::Defaults().log_level);
+
+  // Verify we get the value specified by env var and not the default
+  {
+    EnvVarGuard log_level_guard("ARROW_S3_LOG_LEVEL", "ERROR");
+    ASSERT_EQ(S3LogLevel::Error, arrow::fs::S3GlobalOptions::Defaults().log_level);
+  }
+
+  // Verify we trim and case-insensitively compare the environment variable's value
+  {
+    EnvVarGuard log_level_guard("ARROW_S3_LOG_LEVEL", " eRrOr ");
+    ASSERT_EQ(S3LogLevel::Error, arrow::fs::S3GlobalOptions::Defaults().log_level);
+  }
+
+  // Verify we get the default value of Fatal if our env var is invalid
+  {
+    EnvVarGuard log_level_guard("ARROW_S3_LOG_LEVEL", "invalid");
+    ASSERT_EQ(S3LogLevel::Fatal, arrow::fs::S3GlobalOptions::Defaults().log_level);
+  }
+}
 
 }  // namespace fs
 }  // namespace arrow

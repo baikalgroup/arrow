@@ -16,7 +16,6 @@
 // under the License.
 
 #include "./arrow_types.h"
-#if defined(ARROW_R_WITH_ARROW)
 
 #include <arrow/array.h>
 #include <arrow/builder.h>
@@ -29,6 +28,7 @@
 #include <cpp11/altrep.hpp>
 #include <type_traits>
 
+#include "./extension.h"
 #include "./r_task_group.h"
 
 namespace arrow {
@@ -365,7 +365,7 @@ struct Converter_String : public Converter {
     }
 
     if (nul_was_stripped) {
-      cpp11::warning("Stripping '\\0' (nul) from character vector");
+      cpp11::safe[Rf_warning]("Stripping '\\0' (nul) from character vector");
     }
 
     return Status::OK();
@@ -374,11 +374,11 @@ struct Converter_String : public Converter {
   bool Parallel() const { return false; }
 
  private:
-  static SEXP r_string_from_view(arrow::util::string_view view) {
-    return Rf_mkCharLenCE(view.data(), view.size(), CE_UTF8);
+  static SEXP r_string_from_view(std::string_view view) {
+    return Rf_mkCharLenCE(view.data(), static_cast<int>(view.size()), CE_UTF8);
   }
 
-  static SEXP r_string_from_view_strip_nul(arrow::util::string_view view,
+  static SEXP r_string_from_view_strip_nul(std::string_view view,
                                            bool* nul_was_stripped) {
     const char* old_string = view.data();
 
@@ -391,7 +391,7 @@ struct Converter_String : public Converter {
 
         if (nul_count == 1) {
           // first nul spotted: allocate stripped string storage
-          stripped_string = view.to_string();
+          stripped_string = std::string(view);
           stripped_len = i;
         }
 
@@ -576,10 +576,10 @@ class Converter_Dictionary : public Converter {
       const auto& arr_type = checked_cast<const DictionaryType&>(*chunked_array->type());
       unifier_ = ValueOrStop(DictionaryUnifier::Make(arr_type.value_type()));
 
-      size_t n_arrays = chunked_array->num_chunks();
+      int n_arrays = chunked_array->num_chunks();
       arrays_transpose_.resize(n_arrays);
 
-      for (size_t i = 0; i < n_arrays; i++) {
+      for (int i = 0; i < n_arrays; i++) {
         const auto& dict_i =
             *checked_cast<const DictionaryArray&>(*chunked_array->chunk(i)).dictionary();
         StopIfNotOk(unifier_->Unify(dict_i, &arrays_transpose_[i]));
@@ -706,7 +706,7 @@ class Converter_Dictionary : public Converter {
     // Alternative: preserve the logical type of the dictionary values
     // (e.g. if dict is timestamp, return a POSIXt R vector, not factor)
     if (dictionary_->type_id() != Type::STRING) {
-      cpp11::warning("Coercing dictionary values to R character factor levels");
+      cpp11::safe[Rf_warning]("Coercing dictionary values to R character factor levels");
     }
 
     SEXP vec = PROTECT(Converter::Convert(dictionary_));
@@ -748,7 +748,7 @@ class Converter_Struct : public Converter {
     auto colnames = arrow::r::to_r_strings(
         type->fields(),
         [](const std::shared_ptr<Field>& field) { return field->name(); });
-    out.attr(symbols::row_names) = arrow::r::short_row_names(n);
+    out.attr(symbols::row_names) = arrow::r::short_row_names(static_cast<int>(n));
     out.attr(R_NamesSymbol) = colnames;
     out.attr(R_ClassSymbol) = arrow::r::data::classes_tbl_df;
 
@@ -756,12 +756,12 @@ class Converter_Struct : public Converter {
   }
 
   Status Ingest_all_nulls(SEXP data, R_xlen_t start, R_xlen_t n) const {
-    int nf = converters.size();
+    int nf = static_cast<int>(converters.size());
     for (int i = 0; i < nf; i++) {
       SEXP data_i = VECTOR_ELT(data, i);
 
       // only ingest if the column is not altrep
-      if (!altrep::is_arrow_altrep(data_i)) {
+      if (!altrep::is_unmaterialized_arrow_altrep(data_i)) {
         StopIfNotOk(converters[i]->Ingest_all_nulls(data_i, start, n));
       }
     }
@@ -771,14 +771,14 @@ class Converter_Struct : public Converter {
   Status Ingest_some_nulls(SEXP data, const std::shared_ptr<arrow::Array>& array,
                            R_xlen_t start, R_xlen_t n, size_t chunk_index) const {
     auto struct_array = checked_cast<const arrow::StructArray*>(array.get());
-    int nf = converters.size();
+    int nf = static_cast<int>(converters.size());
     // Flatten() deals with merging of nulls
     auto arrays = ValueOrStop(struct_array->Flatten(gc_memory_pool()));
     for (int i = 0; i < nf; i++) {
       SEXP data_i = VECTOR_ELT(data, i);
 
       // only ingest if the column is not altrep
-      if (!altrep::is_arrow_altrep(data_i)) {
+      if (!altrep::is_unmaterialized_arrow_altrep(data_i)) {
         StopIfNotOk(converters[i]->Ingest_some_nulls(VECTOR_ELT(data, i), arrays[i],
                                                      start, n, chunk_index));
       }
@@ -1154,12 +1154,41 @@ class Converter_Null : public Converter {
   }
 };
 
+// Unlike other types, conversion of ExtensionType (chunked) arrays occurs at
+// R level via the ExtensionType (or subclass) R6 instance. We do this via Allocate,
+// since it is called once per ChunkedArray.
+class Converter_Extension : public Converter {
+ public:
+  explicit Converter_Extension(const std::shared_ptr<ChunkedArray>& chunked_array)
+      : Converter(chunked_array) {}
+
+  SEXP Allocate(R_xlen_t n) const {
+    auto extension_type =
+        dynamic_cast<const RExtensionType*>(chunked_array_->type().get());
+    if (extension_type == nullptr) {
+      Rf_error("Converter_Extension can't be used with a non-R extension type");
+    }
+
+    return extension_type->Convert(chunked_array_);
+  }
+
+  // At this point we have already done the conversion
+  Status Ingest_all_nulls(SEXP data, R_xlen_t start, R_xlen_t n) const {
+    return Status::OK();
+  }
+
+  Status Ingest_some_nulls(SEXP data, const std::shared_ptr<arrow::Array>& array,
+                           R_xlen_t start, R_xlen_t n, size_t chunk_index) const {
+    return Status::OK();
+  }
+};
+
 bool ArraysCanFitInteger(ArrayVector arrays) {
   bool all_can_fit = true;
   auto i32 = arrow::int32();
   for (const auto& array : arrays) {
     if (all_can_fit) {
-      all_can_fit = arrow::IntegersCanFit(arrow::Datum(array), *i32).ok();
+      all_can_fit = arrow::IntegersCanFit(*array->data(), *i32).ok();
     }
   }
   return all_can_fit;
@@ -1316,6 +1345,9 @@ std::shared_ptr<Converter> Converter::Make(
     case Type::NA:
       return std::make_shared<arrow::r::Converter_Null>(chunked_array);
 
+    case Type::EXTENSION:
+      return std::make_shared<arrow::r::Converter_Extension>(chunked_array);
+
     default:
       break;
   }
@@ -1352,7 +1384,7 @@ cpp11::writable::list to_data_frame(const std::shared_ptr<Rectangle>& data,
 
   tbl.attr(R_NamesSymbol) = names;
   tbl.attr(R_ClassSymbol) = arrow::r::data::classes_tbl_df;
-  tbl.attr(R_RowNamesSymbol) = arrow::r::short_row_names(nr);
+  tbl.attr(R_RowNamesSymbol) = arrow::r::short_row_names(static_cast<int>(nr));
 
   return tbl;
 }
@@ -1382,5 +1414,3 @@ cpp11::writable::list Table__to_dataframe(const std::shared_ptr<arrow::Table>& t
                                           bool use_threads) {
   return arrow::r::to_data_frame(table, use_threads);
 }
-
-#endif

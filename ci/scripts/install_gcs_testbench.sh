@@ -24,14 +24,22 @@ if [ "$#" -ne 1 ]; then
   exit 1
 fi
 
-if [ "$(uname -m)" != "x86_64" ]; then
-  echo "GCS testbench won't install on non-x86 architecture"
-  exit 0
-fi
+case "$(uname -m)" in
+  aarch64|arm64|x86_64)
+    : # OK
+    ;;
+  *)
+    echo "GCS testbench is installed only on x86 or arm architectures: $(uname -m)"
+    exit 0
+    ;;
+esac
 
 version=$1
 if [[ "${version}" -eq "default" ]]; then
-  version="v0.7.0"
+  version="v0.39.0"
+  # Latests versions of Testbench require newer setuptools
+  ${PYTHON:-python3} -m pip install --upgrade setuptools
 fi
 
-pip install "https://github.com/googleapis/storage-testbench/archive/${version}.tar.gz"
+${PYTHON:-python3} -m pip install \
+  "https://github.com/googleapis/storage-testbench/archive/${version}.tar.gz"

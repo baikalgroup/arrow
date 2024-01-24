@@ -109,6 +109,7 @@ class LZ4Decompressor : public Decompressor {
     auto dst_capacity = static_cast<size_t>(output_len);
     size_t ret;
 
+    DCHECK_NE(src, nullptr);
     ret =
         LZ4F_decompress(ctx_, dst, &dst_capacity, src, &src_size, nullptr /* options */);
     if (LZ4F_isError(ret)) {
@@ -529,15 +530,15 @@ class Lz4HadoopCodec : public Lz4Codec {
 }  // namespace
 
 std::unique_ptr<Codec> MakeLz4FrameCodec(int compression_level) {
-  return std::unique_ptr<Codec>(new Lz4FrameCodec(compression_level));
+  return std::make_unique<Lz4FrameCodec>(compression_level);
 }
 
 std::unique_ptr<Codec> MakeLz4HadoopRawCodec() {
-  return std::unique_ptr<Codec>(new Lz4HadoopCodec());
+  return std::make_unique<Lz4HadoopCodec>();
 }
 
 std::unique_ptr<Codec> MakeLz4RawCodec(int compression_level) {
-  return std::unique_ptr<Codec>(new Lz4Codec(compression_level));
+  return std::make_unique<Lz4Codec>(compression_level);
 }
 
 }  // namespace internal

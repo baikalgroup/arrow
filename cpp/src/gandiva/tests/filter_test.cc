@@ -42,8 +42,8 @@ class TestFilter : public ::testing::Test {
 
 TEST_F(TestFilter, TestFilterCache) {
   // schema for input fields
-  auto field0 = field("f0", int32());
-  auto field1 = field("f1", int32());
+  auto field0 = field("f0_filter_cache", int32());
+  auto field1 = field("f1_filter_cache", int32());
   auto schema = arrow::schema({field0, field1});
 
   // Build condition f0 + f1 < 10
@@ -69,7 +69,7 @@ TEST_F(TestFilter, TestFilterCache) {
   EXPECT_TRUE(cached_filter->GetBuiltFromCache());
 
   // schema is different should return a new filter.
-  auto field2 = field("f2", int32());
+  auto field2 = field("f2_filter_cache", int32());
   auto different_schema = arrow::schema({field0, field1, field2});
   std::shared_ptr<Filter> should_be_new_filter;
   status =
@@ -405,6 +405,39 @@ TEST_F(TestFilter, TestLike) {
   auto in_batch = arrow::RecordBatch::Make(schema, num_records, {array0});
 
   std::shared_ptr<SelectionVector> selection_vector;
+  status = SelectionVector::MakeInt16(num_records, pool_, &selection_vector);
+  EXPECT_TRUE(status.ok());
+
+  // Evaluate expression
+  status = filter->Evaluate(*in_batch, selection_vector);
+  EXPECT_TRUE(status.ok());
+
+  // Validate results
+  EXPECT_ARROW_ARRAY_EQUALS(exp, selection_vector->ToArray());
+
+  auto literal_escape_pattern =
+      TreeExprBuilder::MakeStringLiteral("%tu^_security^_freeze%");
+  auto escape_char = TreeExprBuilder::MakeStringLiteral("^");
+  like_func = TreeExprBuilder::MakeFunction(
+      "like", {node_f0, literal_escape_pattern, escape_char}, boolean());
+
+  condition = TreeExprBuilder::MakeCondition(like_func);
+
+  status = Filter::Make(schema, condition, TestConfiguration(), &filter);
+  EXPECT_TRUE(status.ok());
+
+  // Create a row-batch with some sample data
+  num_records = 5;
+  array0 = MakeArrowArrayUtf8(
+      {"AAAtu_security_freezeBBB", "hello", "bye", "abc-x", "AAAtusecurityfreezeBBB"},
+      {true, true, true, true, true});
+
+  // expected output (indices for which condition matches)
+  exp = MakeArrowArrayUint16({0});
+
+  // prepare input record batch
+  in_batch = arrow::RecordBatch::Make(schema, num_records, {array0});
+
   status = SelectionVector::MakeInt16(num_records, pool_, &selection_vector);
   EXPECT_TRUE(status.ok());
 

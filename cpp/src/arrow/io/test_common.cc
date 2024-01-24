@@ -20,11 +20,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>  // IWYU pragma: keep
+#include <vector>
 
-#ifdef _WIN32
-#include <crtdbg.h>
-#include <io.h>
-#else
+#ifndef _WIN32
 #include <fcntl.h>
 #endif
 
@@ -33,6 +31,7 @@
 #include "arrow/io/memory.h"
 #include "arrow/memory_pool.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/util/future.h"
 #include "arrow/util/io_util.h"
 
 namespace arrow {
@@ -74,38 +73,6 @@ Status PurgeLocalFileFromOsCache(const std::string& path) {
 #endif
 }
 
-#if defined(_WIN32)
-static void InvalidParamHandler(const wchar_t* expr, const wchar_t* func,
-                                const wchar_t* source_file, unsigned int source_line,
-                                uintptr_t reserved) {
-  wprintf(L"Invalid parameter in function '%s'. Source: '%s' line %d expression '%s'\n",
-          func, source_file, source_line, expr);
-}
-#endif
-
-bool FileIsClosed(int fd) {
-#if defined(_WIN32)
-  // Disables default behavior on wrong params which causes the application to crash
-  // https://msdn.microsoft.com/en-us/library/ksazx244.aspx
-  _set_invalid_parameter_handler(InvalidParamHandler);
-
-  // Disables possible assertion alert box on invalid input arguments
-  _CrtSetReportMode(_CRT_ASSERT, 0);
-
-  int new_fd = _dup(fd);
-  if (new_fd == -1) {
-    return errno == EBADF;
-  }
-  _close(new_fd);
-  return false;
-#else
-  if (-1 != fcntl(fd, F_GETFD)) {
-    return false;
-  }
-  return errno == EBADF;
-#endif
-}
-
 Status ZeroMemoryMap(MemoryMappedFile* file) {
   constexpr int64_t kBufferSize = 512;
   static constexpr uint8_t kZeroBytes[kBufferSize] = {0};
@@ -142,6 +109,68 @@ Result<std::shared_ptr<MemoryMappedFile>> MemoryMapFixture::InitMemoryMap(
 }
 
 void MemoryMapFixture::AppendFile(const std::string& path) { tmp_files_.push_back(path); }
+
+class TrackedRandomAccessFileImpl : public TrackedRandomAccessFile {
+ public:
+  explicit TrackedRandomAccessFileImpl(io::RandomAccessFile* delegate)
+      : delegate_(delegate) {}
+
+  Status Close() override { return delegate_->Close(); }
+  bool closed() const override { return delegate_->closed(); }
+  Result<int64_t> Tell() const override { return delegate_->Tell(); }
+  Status Seek(int64_t position) override { return delegate_->Seek(position); }
+  Result<int64_t> Read(int64_t nbytes, void* out) override {
+    ARROW_ASSIGN_OR_RAISE(auto position, delegate_->Tell());
+    SaveReadRange(position, nbytes);
+    return delegate_->Read(nbytes, out);
+  }
+  Result<std::shared_ptr<Buffer>> Read(int64_t nbytes) override {
+    ARROW_ASSIGN_OR_RAISE(auto position, delegate_->Tell());
+    SaveReadRange(position, nbytes);
+    return delegate_->Read(nbytes);
+  }
+  bool supports_zero_copy() const override { return delegate_->supports_zero_copy(); }
+  Result<int64_t> GetSize() override { return delegate_->GetSize(); }
+  Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+    SaveReadRange(position, nbytes);
+    return delegate_->ReadAt(position, nbytes, out);
+  }
+  Result<std::shared_ptr<Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
+    SaveReadRange(position, nbytes);
+    return delegate_->ReadAt(position, nbytes);
+  }
+  Future<std::shared_ptr<Buffer>> ReadAsync(const io::IOContext& io_context,
+                                            int64_t position, int64_t nbytes) override {
+    SaveReadRange(position, nbytes);
+    return delegate_->ReadAsync(io_context, position, nbytes);
+  }
+
+  int64_t num_reads() const override { return read_ranges_.size(); }
+  int64_t bytes_read() const override {
+    int64_t sum = 0;
+    for (const auto& range : read_ranges_) {
+      sum += range.length;
+    }
+    return sum;
+  }
+
+  const std::vector<io::ReadRange>& get_read_ranges() const override {
+    return read_ranges_;
+  }
+
+ private:
+  io::RandomAccessFile* delegate_;
+  std::vector<io::ReadRange> read_ranges_;
+
+  void SaveReadRange(int64_t offset, int64_t length) {
+    read_ranges_.emplace_back(io::ReadRange{offset, length});
+  }
+};
+
+std::unique_ptr<TrackedRandomAccessFile> TrackedRandomAccessFile::Make(
+    io::RandomAccessFile* target) {
+  return std::make_unique<TrackedRandomAccessFileImpl>(target);
+}
 
 }  // namespace io
 }  // namespace arrow

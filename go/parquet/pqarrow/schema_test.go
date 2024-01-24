@@ -17,14 +17,123 @@
 package pqarrow_test
 
 import (
+	"encoding/base64"
 	"testing"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/pqarrow"
-	"github.com/apache/arrow/go/v8/parquet/schema"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/flight"
+	"github.com/apache/arrow/go/v15/arrow/ipc"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/internal/types"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/metadata"
+	"github.com/apache/arrow/go/v15/parquet/pqarrow"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestGetOriginSchemaBase64(t *testing.T) {
+	uuidType := types.NewUUIDType()
+	md := arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"-1"})
+	extMd := arrow.NewMetadata([]string{ipc.ExtensionMetadataKeyName, ipc.ExtensionTypeKeyName, "PARQUET:field_id"}, []string{uuidType.Serialize(), uuidType.ExtensionName(), "-1"})
+	origArrSc := arrow.NewSchema([]arrow.Field{
+		{Name: "f1", Type: arrow.BinaryTypes.String, Metadata: md},
+		{Name: "f2", Type: arrow.PrimitiveTypes.Int64, Metadata: md},
+		{Name: "uuid", Type: uuidType, Metadata: extMd},
+	}, nil)
+
+	arrSerializedSc := flight.SerializeSchema(origArrSc, memory.DefaultAllocator)
+	if err := arrow.RegisterExtensionType(uuidType); err != nil {
+		t.Fatal(err)
+	}
+	defer arrow.UnregisterExtensionType(uuidType.ExtensionName())
+	pqschema, err := pqarrow.ToParquet(origArrSc, nil, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		enc  *base64.Encoding
+	}{
+		{"raw", base64.RawStdEncoding},
+		{"std", base64.StdEncoding},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kv := metadata.NewKeyValueMetadata()
+			kv.Append("ARROW:schema", tt.enc.EncodeToString(arrSerializedSc))
+			arrsc, err := pqarrow.FromParquet(pqschema, nil, kv)
+			assert.NoError(t, err)
+			assert.True(t, origArrSc.Equal(arrsc))
+		})
+	}
+}
+
+func TestGetOriginSchemaUnregisteredExtension(t *testing.T) {
+	uuidType := types.NewUUIDType()
+	if err := arrow.RegisterExtensionType(uuidType); err != nil {
+		t.Fatal(err)
+	}
+
+	md := arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"-1"})
+	origArrSc := arrow.NewSchema([]arrow.Field{
+		{Name: "f1", Type: arrow.BinaryTypes.String, Metadata: md},
+		{Name: "f2", Type: arrow.PrimitiveTypes.Int64, Metadata: md},
+		{Name: "uuid", Type: uuidType, Metadata: md},
+	}, nil)
+	pqschema, err := pqarrow.ToParquet(origArrSc, nil, pqarrow.DefaultWriterProps())
+	require.NoError(t, err)
+
+	arrSerializedSc := flight.SerializeSchema(origArrSc, memory.DefaultAllocator)
+	kv := metadata.NewKeyValueMetadata()
+	kv.Append("ARROW:schema", base64.StdEncoding.EncodeToString(arrSerializedSc))
+
+	arrow.UnregisterExtensionType(uuidType.ExtensionName())
+	arrsc, err := pqarrow.FromParquet(pqschema, nil, kv)
+	require.NoError(t, err)
+
+	extMd := arrow.NewMetadata([]string{ipc.ExtensionMetadataKeyName, ipc.ExtensionTypeKeyName, "PARQUET:field_id"},
+		[]string{uuidType.Serialize(), uuidType.ExtensionName(), "-1"})
+	expArrSc := arrow.NewSchema([]arrow.Field{
+		{Name: "f1", Type: arrow.BinaryTypes.String, Metadata: md},
+		{Name: "f2", Type: arrow.PrimitiveTypes.Int64, Metadata: md},
+		{Name: "uuid", Type: uuidType.StorageType(), Metadata: extMd},
+	}, nil)
+
+	assert.Truef(t, expArrSc.Equal(arrsc), "expected: %s\ngot: %s", expArrSc, arrsc)
+}
+
+func TestToParquetWriterConfig(t *testing.T) {
+	origSc := arrow.NewSchema([]arrow.Field{
+		{Name: "f1", Type: arrow.BinaryTypes.String},
+		{Name: "f2", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+
+	tests := []struct {
+		name           string
+		rootRepetition parquet.Repetition
+	}{
+		{"test1", parquet.Repetitions.Required},
+		{"test2", parquet.Repetitions.Repeated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			pqschema, err := pqarrow.ToParquet(origSc,
+				parquet.NewWriterProperties(
+					parquet.WithRootName(tt.name),
+					parquet.WithRootRepetition(tt.rootRepetition),
+				),
+				pqarrow.DefaultWriterProps())
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.name, pqschema.Root().Name())
+			assert.Equal(t, tt.rootRepetition, pqschema.Root().RepetitionType())
+		})
+	}
+}
 
 func TestConvertArrowFlatPrimitives(t *testing.T) {
 	parquetFields := make(schema.FieldList, 0)
@@ -171,6 +280,25 @@ func TestConvertArrowDecimals(t *testing.T) {
 	}
 }
 
+func TestConvertArrowFloat16(t *testing.T) {
+	parquetFields := make(schema.FieldList, 0)
+	arrowFields := make([]arrow.Field, 0)
+
+	parquetFields = append(parquetFields, schema.Must(schema.NewPrimitiveNodeLogical("float16", parquet.Repetitions.Required,
+		schema.Float16LogicalType{}, parquet.Types.FixedLenByteArray, 2, -1)))
+	arrowFields = append(arrowFields, arrow.Field{Name: "float16", Type: &arrow.Float16Type{}})
+
+	arrowSchema := arrow.NewSchema(arrowFields, nil)
+	parquetSchema := schema.NewSchema(schema.MustGroup(schema.NewGroupNode("schema", parquet.Repetitions.Repeated, parquetFields, -1)))
+
+	result, err := pqarrow.ToParquet(arrowSchema, nil, pqarrow.NewArrowWriterProperties(pqarrow.WithDeprecatedInt96Timestamps(true)))
+	assert.NoError(t, err)
+	assert.True(t, parquetSchema.Equals(result))
+	for i := 0; i < parquetSchema.NumColumns(); i++ {
+		assert.Truef(t, parquetSchema.Column(i).Equals(result.Column(i)), "Column %d didn't match: %s", i, parquetSchema.Column(i).Name())
+	}
+}
+
 func TestCoerceTImestampV1(t *testing.T) {
 	parquetFields := make(schema.FieldList, 0)
 	arrowFields := make([]arrow.Field, 0)
@@ -241,5 +369,89 @@ func TestConvertArrowStruct(t *testing.T) {
 	assert.True(t, parquetSchema.Equals(result))
 	for i := 0; i < parquetSchema.NumColumns(); i++ {
 		assert.Truef(t, parquetSchema.Column(i).Equals(result.Column(i)), "Column %d didn't match: %s", i, parquetSchema.Column(i).Name())
+	}
+}
+
+func TestListStructBackwardCompatible(t *testing.T) {
+	// Set up old construction for list of struct, not using
+	// the 3-level encoding. Schema looks like:
+	//
+	//     required group field_id=-1 root {
+	//       optional group field_id=-1 answers (List) {
+	//		   repeated group field_id=-1 array {
+	//           optional byte_array field_id=-1 type (String);
+	//           optional byte_array field_id=-1 rdata (String);
+	//           optional byte_array field_id=-1 class (String);
+	//         }
+	//       }
+	//     }
+	//
+	// Instead of the proper 3-level encoding which would be:
+	//
+	//     repeated group field_id=-1 schema {
+	//       optional group field_id=-1 answers (List) {
+	//         repeated group field_id=-1 list {
+	//           optional group field_id=-1 element {
+	//             optional byte_array field_id=-1 type (String);
+	//             optional byte_array field_id=-1 rdata (String);
+	//             optional byte_array field_id=-1 class (String);
+	//           }
+	//         }
+	//       }
+	//     }
+	//
+	pqSchema := schema.NewSchema(schema.MustGroup(schema.NewGroupNode("root", parquet.Repetitions.Required, schema.FieldList{
+		schema.Must(schema.NewGroupNodeLogical("answers", parquet.Repetitions.Optional, schema.FieldList{
+			schema.Must(schema.NewGroupNode("array", parquet.Repetitions.Repeated, schema.FieldList{
+				schema.MustPrimitive(schema.NewPrimitiveNodeLogical("type", parquet.Repetitions.Optional,
+					schema.StringLogicalType{}, parquet.Types.ByteArray, -1, -1)),
+				schema.MustPrimitive(schema.NewPrimitiveNodeLogical("rdata", parquet.Repetitions.Optional,
+					schema.StringLogicalType{}, parquet.Types.ByteArray, -1, -1)),
+				schema.MustPrimitive(schema.NewPrimitiveNodeLogical("class", parquet.Repetitions.Optional,
+					schema.StringLogicalType{}, parquet.Types.ByteArray, -1, -1)),
+			}, -1)),
+		}, schema.NewListLogicalType(), -1)),
+	}, -1)))
+
+	meta := arrow.NewMetadata([]string{"PARQUET:field_id"}, []string{"-1"})
+	// desired equivalent arrow schema would be list<item: struct<type: utf8, rdata: utf8, class: utf8>>
+	arrowSchema := arrow.NewSchema(
+		[]arrow.Field{
+			{Name: "answers", Type: arrow.ListOfField(arrow.Field{
+				Name: "array", Type: arrow.StructOf(
+					arrow.Field{Name: "type", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: meta},
+					arrow.Field{Name: "rdata", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: meta},
+					arrow.Field{Name: "class", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: meta},
+				), Nullable: true}), Nullable: true, Metadata: meta},
+		}, nil)
+
+	arrsc, err := pqarrow.FromParquet(pqSchema, nil, metadata.KeyValueMetadata{})
+	assert.NoError(t, err)
+	assert.True(t, arrowSchema.Equal(arrsc))
+}
+
+// TestUnsupportedTypes tests the error message for unsupported types. This test should be updated
+// when support for these types is added.
+func TestUnsupportedTypes(t *testing.T) {
+	unsupportedTypes := []struct {
+		typ arrow.DataType
+	}{
+		// Non-exhaustive list of unsupported types
+		{typ: &arrow.DurationType{}},
+		{typ: &arrow.DayTimeIntervalType{}},
+		{typ: &arrow.MonthIntervalType{}},
+		{typ: &arrow.MonthDayNanoIntervalType{}},
+		{typ: &arrow.DenseUnionType{}},
+		{typ: &arrow.SparseUnionType{}},
+	}
+	for _, tc := range unsupportedTypes {
+		t.Run(tc.typ.ID().String(), func(t *testing.T) {
+			arrowFields := make([]arrow.Field, 0)
+			arrowFields = append(arrowFields, arrow.Field{Name: "unsupported", Type: tc.typ, Nullable: true})
+			arrowSchema := arrow.NewSchema(arrowFields, nil)
+			_, err := pqarrow.ToParquet(arrowSchema, nil, pqarrow.NewArrowWriterProperties())
+			assert.ErrorIs(t, err, arrow.ErrNotImplemented)
+			assert.ErrorContains(t, err, "support for "+tc.typ.ID().String())
+		})
 	}
 }

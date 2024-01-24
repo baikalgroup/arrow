@@ -85,13 +85,13 @@ where the leaf image is ``conda-python-pandas``.
 
 .. code:: bash
 
-    PANDAS=master archery docker run --no-leaf-cache conda-python-pandas
+    PANDAS=upstream_devel archery docker run --no-leaf-cache conda-python-pandas
 
 Which translates to:
 
 .. code:: bash
 
-    export PANDAS=master
+    export PANDAS=upstream_devel
     docker-compose pull --ignore-pull-failures conda-cpp
     docker-compose pull --ignore-pull-failures conda-python
     docker-compose build conda-cpp
@@ -102,8 +102,8 @@ Which translates to:
 Note that it doesn't pull the conda-python-pandas image and disable the cache
 when building it.
 
-``PANDAS`` is a `build parameter <Docker Build Parameters>`_, see the
-defaults in the .env file.
+``PANDAS`` is a :ref:`build parameter <docker-build-parameters>`, see the
+defaults in the ``.env`` file.
 
 **To entirely skip building the image:**
 
@@ -178,6 +178,8 @@ image when building Glib, Ruby, R and Python bindings.
 This reduces duplication and streamlines maintenance, but makes the
 docker-compose configuration more complicated.
 
+.. _docker-build-parameters:
+
 Docker Build Parameters
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -197,8 +199,8 @@ For detailed examples see the docker-compose.yml.
 Build Scripts
 ~~~~~~~~~~~~~
 
-The scripts maintainted under ci/scripts directory should be kept
-parametrizable but reasonably minimal to clearly encapsulate the tasks it is
+The scripts maintained under ci/scripts directory should be kept
+parameterizable but reasonably minimal to clearly encapsulate the tasks it is
 responsible for. Like:
 
 - ``cpp_build.sh``: build the C++ implementation without running the tests.

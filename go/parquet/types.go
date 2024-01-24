@@ -24,8 +24,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	format "github.com/apache/arrow/go/v8/parquet/internal/gen-go/parquet"
+	"github.com/apache/arrow/go/v15/arrow"
+	format "github.com/apache/arrow/go/v15/parquet/internal/gen-go/parquet"
 )
 
 const (
@@ -54,7 +54,7 @@ var (
 // to be able to call ReadAt, Read, and Seek
 type ReaderAtSeeker interface {
 	io.ReaderAt
-	io.ReadSeeker
+	io.Seeker
 }
 
 // NewInt96 creates a new Int96 from the given 3 uint32 values.
@@ -131,6 +131,10 @@ func (b ByteArray) String() string {
 	return *(*string)(unsafe.Pointer(&b))
 }
 
+func (b ByteArray) Bytes() []byte {
+	return b
+}
+
 type byteArrayTraits struct{}
 
 func (byteArrayTraits) BytesRequired(n int) int {
@@ -160,6 +164,10 @@ func (b FixedLenByteArray) Len() int {
 // String returns a string representation of the FixedLenByteArray
 func (b FixedLenByteArray) String() string {
 	return *(*string)(unsafe.Pointer(&b))
+}
+
+func (b FixedLenByteArray) Bytes() []byte {
+	return b
 }
 
 type fixedLenByteArrayTraits struct{}
@@ -287,7 +295,7 @@ var (
 		Double            Type
 		ByteArray         Type
 		FixedLenByteArray Type
-		// this only exists as a convienence so we can denote it when necessary
+		// this only exists as a convenience so we can denote it when necessary
 		// nearly all functions that take a parquet.Type will error/panic if given
 		// Undefined
 		Undefined Type

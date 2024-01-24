@@ -17,14 +17,15 @@
 package pqarrow
 
 import (
+	"fmt"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/array"
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet/internal/encoding"
-	"github.com/apache/arrow/go/v8/parquet/internal/utils"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/array"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/internal/bitutils"
+	"github.com/apache/arrow/go/v15/parquet/internal/encoding"
 	"golang.org/x/xerrors"
 )
 
@@ -116,7 +117,7 @@ func (n *nullableTerminalNode) run(rng elemRange, ctx *pathWriteCtx) iterResult 
 		present = (*(*[2]byte)(unsafe.Pointer(&n.defLevelIfPresent)))[:]
 		null    = (*(*[2]byte)(unsafe.Pointer(&n.defLevelIfNull)))[:]
 	)
-	rdr := utils.NewBitRunReader(n.bitmap, n.elemOffset+rng.start, elems)
+	rdr := bitutils.NewBitRunReader(n.bitmap, n.elemOffset+rng.start, elems)
 	for {
 		run := rdr.NextRun()
 		if run.Len == 0 {
@@ -205,7 +206,7 @@ func (n *listNode) fillForLast(rng, childRng *elemRange, ctx *pathWriteCtx) iter
 	fillRepLevels(int(childRng.size()), n.repLevel, ctx)
 	// once we've reached this point the following preconditions should hold:
 	// 1. there are no more repeated path nodes to deal with
-	// 2. all elements in |range| reperesent contiguous elements in the child
+	// 2. all elements in |range| represent contiguous elements in the child
 	//    array (null values would have shortened the range to ensure all
 	//    remaining list elements are present, though they may be empty)
 	// 3. no element of range spans a parent list (intermediate list nodes
@@ -224,7 +225,7 @@ func (n *listNode) fillForLast(rng, childRng *elemRange, ctx *pathWriteCtx) iter
 
 		// this is the start of a new list. we can be sure that it only applies to the
 		// previous list (and doesn't jump to the start of any list further up in nesting
-		// due to the contraints mentioned earlier)
+		// due to the constraints mentioned earlier)
 		ctx.AppendRepLevel(n.prevRepLevel)
 		ctx.AppendRepLevels(int(sizeCheck.size())-1, n.repLevel)
 		childRng.end = sizeCheck.end
@@ -244,7 +245,7 @@ type nullableNode struct {
 	repLevelIfNull int16
 	defLevelIfNull int16
 
-	validBitsReader utils.BitRunReader
+	validBitsReader bitutils.BitRunReader
 	newRange        bool
 }
 
@@ -255,7 +256,7 @@ func (n *nullableNode) clone() pathNode {
 
 func (n *nullableNode) run(rng, childRng *elemRange, ctx *pathWriteCtx) iterResult {
 	if n.newRange {
-		n.validBitsReader = utils.NewBitRunReader(n.bitmap, n.entryOffset+rng.start, rng.size())
+		n.validBitsReader = bitutils.NewBitRunReader(n.bitmap, n.entryOffset+rng.start, rng.size())
 	}
 	childRng.start = rng.start
 	run := n.validBitsReader.NextRun()
@@ -399,7 +400,7 @@ func (p *pathBuilder) Visit(arr arrow.Array) error {
 		p.maybeAddNullable(arr)
 		larr := arr.(*array.FixedSizeList)
 		listSize := larr.DataType().(*arrow.FixedSizeListType).Len()
-		// technically we could encoded fixed sized lists with two level encodings
+		// technically we could encode fixed sized lists with two level encodings
 		// but we always use 3 level encoding, so we increment def levels as well
 		p.info.maxDefLevel++
 		p.info.maxRepLevel++
@@ -412,7 +413,20 @@ func (p *pathBuilder) Visit(arr arrow.Array) error {
 		// if arr.data.offset > 0, slice?
 		return p.Visit(larr.ListValues())
 	case arrow.DICTIONARY:
-		return xerrors.New("dictionary types not implemented yet")
+		// only currently handle dictionaryarray where the dictionary
+		// is a primitive type
+		dictArr := arr.(*array.Dictionary)
+		valType := dictArr.DataType().(*arrow.DictionaryType).ValueType
+		if _, ok := valType.(arrow.NestedType); ok {
+			return fmt.Errorf("%w: writing DictionaryArray with nested dictionary type not yet supported",
+				arrow.ErrNotImplemented)
+		}
+		if dictArr.Dictionary().NullN() > 0 {
+			return fmt.Errorf("%w: writing DictionaryArray with null encoded in dictionary not yet supported",
+				arrow.ErrNotImplemented)
+		}
+		p.addTerminalInfo(arr)
+		return nil
 	case arrow.STRUCT:
 		p.maybeAddNullable(arr)
 		infoBackup := p.info
@@ -426,7 +440,7 @@ func (p *pathBuilder) Visit(arr arrow.Array) error {
 		}
 		return nil
 	case arrow.EXTENSION:
-		return xerrors.New("extension types not implemented yet")
+		return p.Visit(arr.(array.ExtensionArray).Storage())
 	case arrow.SPARSE_UNION, arrow.DENSE_UNION:
 		return xerrors.New("union types aren't supported in parquet")
 	default:
@@ -555,7 +569,6 @@ type multipathLevelResult struct {
 }
 
 func (m *multipathLevelResult) Release() {
-	m.leafArr.Release()
 	m.defLevels = nil
 	if m.defLevelsBuffer != nil {
 		m.defLevelsBuffer.Release()
@@ -652,7 +665,7 @@ func fillRepLevels(count int, repLvl int16, ctx *pathWriteCtx) {
 
 	fillCount := count
 	// this condition occurs (rep and def levels equals), in one of a few cases:
-	// 1. before any list is encounted
+	// 1. before any list is encountered
 	// 2. after rep-level has been filled in due to null/empty values above
 	// 3. after finishing a list
 	if !ctx.equalRepDeflevlsLen() {

@@ -2,23 +2,18 @@
 % Please edit documentation in R/duckdb.R
 \name{to_arrow}
 \alias{to_arrow}
-\title{Create an Arrow object from others}
+\title{Create an Arrow object from a DuckDB connection}
 \usage{
-to_arrow(.data, as_arrow_query = TRUE)
+to_arrow(.data)
 }
 \arguments{
 \item{.data}{the object to be converted}
-
-\item{as_arrow_query}{should the returned object be wrapped as an
-\code{arrow_dplyr_query}? (logical, default: \code{TRUE})}
 }
 \value{
-a \code{RecordBatchReader} object, wrapped as an arrow dplyr query which
-can be used in dplyr pipelines.
+A \code{RecordBatchReader}.
 }
 \description{
-This can be used in pipelines that pass data back and forth between Arrow and
-other processes (like DuckDB).
+This can be used in pipelines that pass data back and forth between Arrow and DuckDB
 }
 \examples{
 \dontshow{if (getFromNamespace("run_duckdb_examples", "arrow")()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}

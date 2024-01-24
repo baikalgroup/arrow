@@ -38,7 +38,6 @@ import { instance as getVisitor } from './visitor/get.js';
 import { instance as setVisitor } from './visitor/set.js';
 import { instance as indexOfVisitor } from './visitor/indexof.js';
 import { instance as iteratorVisitor } from './visitor/iterator.js';
-import { instance as byteLengthVisitor } from './visitor/bytelength.js';
 
 import { DataProps } from './data.js';
 import { clampRange } from './util/vector.js';
@@ -73,6 +72,8 @@ export class Table<T extends TypeMap = any> {
     constructor(...batches: readonly RecordBatch<T>[]);
     constructor(...columns: { [P in keyof T]: Vector<T[P]> }[]);
     constructor(...columns: { [P in keyof T]: Data<T[P]> | DataProps<T[P]> }[]);
+    constructor(schema: Schema<T>, ...columns: { [P in keyof T]: Vector<T[P]> }[]);
+    constructor(schema: Schema<T>, ...columns: { [P in keyof T]: Data<T[P]> | DataProps<T[P]> }[]);
     constructor(schema: Schema<T>, data?: RecordBatch<T> | RecordBatch<T>[]);
     constructor(schema: Schema<T>, data?: RecordBatch<T> | RecordBatch<T>[], offsets?: Uint32Array);
     constructor(...args: any[]) {
@@ -91,7 +92,7 @@ export class Table<T extends TypeMap = any> {
             schema = args.shift() as Schema<T>;
         }
 
-        if (args[args.length - 1] instanceof Uint32Array) {
+        if (args.at(-1) instanceof Uint32Array) {
             offsets = args.pop();
         }
 
@@ -112,8 +113,8 @@ export class Table<T extends TypeMap = any> {
                 } else if (typeof x === 'object') {
                     const keys = Object.keys(x) as (keyof T)[];
                     const vecs = keys.map((k) => new Vector([x[k]]));
-                    const schema = new Schema(keys.map((k, i) => new Field(String(k), vecs[i].type)));
-                    const [, batches] = distributeVectorsIntoRecordBatches(schema, vecs);
+                    const batchSchema = schema ?? new Schema(keys.map((k, i) => new Field(String(k), vecs[i].type, vecs[i].nullable)));
+                    const [, batches] = distributeVectorsIntoRecordBatches(batchSchema, vecs);
                     return batches.length === 0 ? [new RecordBatch(x)] : batches;
                 }
             }
@@ -214,17 +215,13 @@ export class Table<T extends TypeMap = any> {
     public indexOf(element: Struct<T>['TValue'], offset?: number): number { return -1; }
 
     /**
-     * Get the size in bytes of an element by index.
-     * @param index The index at which to get the byteLength.
-     */
-    // @ts-ignore
-    public getByteLength(index: number): number { return 0; }
-
-    /**
      * Iterator for rows in this Table.
      */
     public [Symbol.iterator]() {
-        return iteratorVisitor.visit(new Vector(this.data));
+        if (this.batches.length > 0) {
+            return iteratorVisitor.visit(new Vector(this.data)) as IterableIterator<Struct<T>['TValue']>;
+        }
+        return (new Array(0))[Symbol.iterator]();
     }
 
     /**
@@ -239,7 +236,7 @@ export class Table<T extends TypeMap = any> {
     /**
      * Returns a string representation of the Table rows.
      *
-     * @returns  A string representation of the Table rows.
+     * @returns A string representation of the Table rows.
      */
     public toString() {
         return `[\n  ${this.toArray().join(',\n  ')}\n]`;
@@ -259,7 +256,7 @@ export class Table<T extends TypeMap = any> {
     /**
      * Return a zero-copy sub-section of this Table.
      *
-     * @param start The beginning of the specified portion of the Table.
+     * @param begin The beginning of the specified portion of the Table.
      * @param end The end of the specified portion of the Table. This is exclusive of the element at the index 'end'.
      */
     public slice(begin?: number, end?: number): Table<T> {
@@ -385,7 +382,6 @@ export class Table<T extends TypeMap = any> {
         (proto as any)['get'] = wrapChunkedCall1(getVisitor.getVisitFn(Type.Struct));
         (proto as any)['set'] = wrapChunkedCall2(setVisitor.getVisitFn(Type.Struct));
         (proto as any)['indexOf'] = wrapChunkedIndexOf(indexOfVisitor.getVisitFn(Type.Struct));
-        (proto as any)['getByteLength'] = wrapChunkedCall1(byteLengthVisitor.getVisitFn(Type.Struct));
         return 'Table';
     })(Table.prototype);
 }
@@ -427,7 +423,7 @@ export function makeTable<I extends Record<string | number | symbol, TypedArray>
  * })
  * ```
  *
- * @param Input an object of typed arrays or JavaScript arrays.
+ * @param input Input an object of typed arrays or JavaScript arrays.
  * @returns A new Table.
  */
 export function tableFromArrays<I extends Record<string | number | symbol, TypedArray | BigIntArray | readonly unknown[]>>(input: I): Table<{ [P in keyof I]: ArrayDataType<I[P]> }> {

@@ -22,10 +22,10 @@ import { Builder, BuilderOptions, VariableWidthBuilder } from '../builder.js';
 
 /** @ignore */
 export class ListBuilder<T extends DataType = any, TNull = any> extends VariableWidthBuilder<List<T>, TNull> {
-    protected _offsets: OffsetsBufferBuilder;
+    protected _offsets: OffsetsBufferBuilder<List<T>>;
     constructor(opts: BuilderOptions<List<T>, TNull>) {
         super(opts);
-        this._offsets = new OffsetsBufferBuilder();
+        this._offsets = new OffsetsBufferBuilder(opts.type);
     }
     public addChild(child: Builder<T>, name = '0') {
         if (this.numChildren > 0) {
@@ -39,13 +39,14 @@ export class ListBuilder<T extends DataType = any, TNull = any> extends Variable
         const offsets = this._offsets;
         const [child] = this.children;
         for (const [index, value] of pending) {
-            if (value === undefined) {
+            if (typeof value === 'undefined') {
                 offsets.set(index, 0);
             } else {
-                const n = value.length;
+                const v = value as T['TValue'];
+                const n = v.length;
                 const start = offsets.set(index, n).buffer[index];
                 for (let i = -1; ++i < n;) {
-                    child.set(start + i, value[i]);
+                    child.set(start + i, v[i]);
                 }
             }
         }

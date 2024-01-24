@@ -315,6 +315,8 @@ TEST_F(TestHashKernel, UniqueTimeTimestamp) {
 
   CheckUnique<TimestampType, int64_t>(timestamp(TimeUnit::NANO), {2, 1, 2, 1},
                                       {true, false, true, true}, {2, 0, 1}, {1, 0, 1});
+  CheckUnique<DurationType, int64_t>(duration(TimeUnit::NANO), {2, 1, 2, 1},
+                                     {true, false, true, true}, {2, 0, 1}, {1, 0, 1});
 }
 
 TEST_F(TestHashKernel, ValueCountsTimeTimestamp) {
@@ -329,6 +331,9 @@ TEST_F(TestHashKernel, ValueCountsTimeTimestamp) {
   CheckValueCounts<TimestampType, int64_t>(timestamp(TimeUnit::NANO), {2, 1, 2, 1},
                                            {true, false, true, true}, {2, 0, 1},
                                            {1, 0, 1}, {2, 1, 1});
+  CheckValueCounts<DurationType, int64_t>(duration(TimeUnit::NANO), {2, 1, 2, 1},
+                                          {true, false, true, true}, {2, 0, 1}, {1, 0, 1},
+                                          {2, 1, 1});
 }
 
 TEST_F(TestHashKernel, UniqueBoolean) {
@@ -636,6 +641,59 @@ TEST_F(TestHashKernel, DictEncodeDecimal) {
   CheckDictEncode<Decimal128Type, Decimal128>(decimal(2, 0), values,
                                               {true, false, true, true, true}, expected,
                                               {}, {0, 0, 1, 0, 2});
+}
+
+TEST_F(TestHashKernel, UniqueIntervalMonth) {
+  CheckUnique<MonthIntervalType, int32_t>(month_interval(), {2, 1, 2, 1},
+                                          {true, false, true, true}, {2, 0, 1},
+                                          {true, false, true});
+
+  CheckUnique<DayTimeIntervalType, DayTimeIntervalType::DayMilliseconds>(
+      day_time_interval(), {{2, 1}, {3, 2}, {2, 1}, {1, 2}}, {true, false, true, true},
+      {{2, 1}, {1, 1}, {1, 2}}, {true, false, true});
+
+  CheckUnique<MonthDayNanoIntervalType, MonthDayNanoIntervalType::MonthDayNanos>(
+      month_day_nano_interval(), {{2, 1, 1}, {3, 2, 1}, {2, 1, 1}, {1, 2, 1}},
+      {true, false, true, true}, {{2, 1, 1}, {1, 1, 1}, {1, 2, 1}}, {true, false, true});
+}
+
+TEST_F(TestHashKernel, ValueCountsIntervalMonth) {
+  CheckValueCounts<MonthIntervalType, int32_t>(month_interval(), {2, 1, 2, 1},
+                                               {true, false, true, true}, {2, 0, 1},
+                                               {true, false, true}, {2, 1, 1});
+
+  CheckValueCounts<DayTimeIntervalType, DayTimeIntervalType::DayMilliseconds>(
+      day_time_interval(), {{2, 1}, {3, 2}, {2, 1}, {1, 2}}, {true, false, true, true},
+      {{2, 1}, {1, 1}, {1, 2}}, {true, false, true}, {2, 1, 1});
+
+  CheckValueCounts<MonthDayNanoIntervalType, MonthDayNanoIntervalType::MonthDayNanos>(
+      month_day_nano_interval(), {{2, 1, 1}, {3, 2, 1}, {2, 1, 1}, {1, 2, 1}},
+      {true, false, true, true}, {{2, 1, 1}, {1, 1, 1}, {1, 2, 1}}, {true, false, true},
+      {2, 1, 1});
+}
+
+TEST_F(TestHashKernel, DictEncodeIntervalMonth) {
+  CheckDictEncode<MonthIntervalType, int32_t>(month_interval(), {2, 2, 1, 2, 3},
+                                              {true, false, true, true, true}, {2, 1, 3},
+                                              {}, {0, 0, 1, 0, 2});
+
+  CheckDictEncode<DayTimeIntervalType, DayTimeIntervalType::DayMilliseconds>(
+      day_time_interval(), {{2, 1}, {2, 1}, {3, 2}, {2, 1}, {1, 2}},
+      {true, false, true, true, true}, {{2, 1}, {3, 2}, {1, 2}}, {}, {0, 0, 1, 0, 2});
+
+  CheckDictEncode<MonthDayNanoIntervalType, MonthDayNanoIntervalType::MonthDayNanos>(
+      month_day_nano_interval(), {{2, 1, 1}, {2, 1, 1}, {3, 2, 1}, {2, 1, 1}, {1, 2, 1}},
+      {true, false, true, true, true}, {{2, 1, 1}, {3, 2, 1}, {1, 2, 1}}, {},
+      {0, 0, 1, 0, 2});
+}
+
+TEST_F(TestHashKernel, DictEncodeDictInput) {
+  // Dictionary encode a dictionary is a no-op
+  auto dict_ty = dictionary(int32(), utf8());
+  auto dict = ArrayFromJSON(utf8(), R"(["a", "b", "c"])");
+  auto indices = ArrayFromJSON(int32(), "[0, 1, 2, 0, 1, 2, 0, 1, 2]");
+  auto input = std::make_shared<DictionaryArray>(dict_ty, indices, dict);
+  CheckDictEncode(input, dict, indices);
 }
 
 TEST_F(TestHashKernel, DictionaryUniqueAndValueCounts) {

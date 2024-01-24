@@ -44,7 +44,9 @@ describe('Generated Test Data', () => {
     describe('Float32Builder', () => { validateBuilder(generate.float32); });
     describe('Float64Builder', () => { validateBuilder(generate.float64); });
     describe('Utf8Builder', () => { validateBuilder(generate.utf8); });
+    describe('LargeUtf8Builder', () => { validateBuilder(generate.largeUtf8); });
     describe('BinaryBuilder', () => { validateBuilder(generate.binary); });
+    describe('LargeBinaryBuilder', () => { validateBuilder(generate.largeBinary); });
     describe('FixedSizeBinaryBuilder', () => { validateBuilder(generate.fixedSizeBinary); });
     describe('DateDayBuilder', () => { validateBuilder(generate.dateDay); });
     describe('DateMillisecondBuilder', () => { validateBuilder(generate.dateMillisecond); });
@@ -64,6 +66,10 @@ describe('Generated Test Data', () => {
     describe('DictionaryBuilder', () => { validateBuilder(generate.dictionary); });
     describe('IntervalDayTimeBuilder', () => { validateBuilder(generate.intervalDayTime); });
     describe('IntervalYearMonthBuilder', () => { validateBuilder(generate.intervalYearMonth); });
+    describe('DurationSecondBuilder', () => { validateBuilder(generate.durationSecond); });
+    describe('DurationMillisecondBuilder', () => { validateBuilder(generate.durationMillisecond); });
+    describe('DurationMicrosecondBuilder', () => { validateBuilder(generate.durationMicrosecond); });
+    describe('DurationNanosecondBuilder', () => { validateBuilder(generate.durationNanosecond); });
     describe('FixedSizeListBuilder', () => { validateBuilder(generate.fixedSizeList); });
     describe('MapBuilder', () => { validateBuilder(generate.map); });
 });
@@ -75,6 +81,7 @@ function validateBuilder(generate: (length?: number, nullCount?: number, ...args
     for (let i = -1; ++i < 1;) {
         validateBuilderWithNullValues(`no nulls`, [], generate(100, 0));
         validateBuilderWithNullValues(`with nulls`, [null], generate(100));
+        validateBuilderWithNullValues(`with nulls (length=518)`, [null], generate(518));
         if (DataType.isUtf8(type)) {
             validateBuilderWithNullValues(`with \\0`, ['\0'], generate(100));
             validateBuilderWithNullValues(`with n/a`, ['n/a'], generate(100));

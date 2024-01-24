@@ -28,28 +28,29 @@
 Lifecycle of a pull request
 ***************************
 
-:ref:`As mentioned before<set-up>`, the Arrow project uses Git for
-version control and a workflow based on pull requests. That means
-that you contribute the changes to the code by creating a branch
-in Git, make changes to the code, push the changes to your ``origin``
-which is your fork of the Arrow repository on GitHub and then you
-create a **pull request** against the official Arrow repository
-which is saved in your set up as ``upstream``.
+:ref:`As mentioned before<set-up>`, the Arrow project uses Git
+for version control and a workflow based on pull requests. That
+means that you contribute the changes, or "patches", to the code
+by creating a branch in Git, make changes to the code, push the
+changes to your ``origin`` which is your fork of the Arrow
+repository on GitHub and then you create a **pull request** against
+the official Arrow repository which is saved in your set up as
+``upstream``.
 
 You should have Git set up by now, have cloned the repository,
-have successfully built Arrow and have a JIRA issue to work on.
+have successfully built Arrow and have a GitHub issue to work on.
 
 **Before making changes to the code, you should create a new
 branch in Git.**
 
-1. Update your fork’s master branch with ``upstream/master``.
+1. Update your fork’s main branch with ``upstream/main``.
    Run this in the shell from the ``arrow`` directory.
 
    .. code:: console
 
-      $ git checkout master # select the main Arrow branch
-      $ git fetch upstream # check for changes in upstream/master
-      $ git pull --ff-only upstream master # save the changes from upstream/master
+      $ git checkout main # select the main Arrow branch
+      $ git fetch upstream # check for changes in upstream/main
+      $ git pull --ff-only upstream main # save the changes from upstream/main
 
    Note: ``--ff-only`` applies changes only if they can be fast-forwarded
    without conflicts or creating merge commits.
@@ -61,7 +62,7 @@ branch in Git.**
       $ git checkout -b <branch-name>
 
    or (does the same thing)
-   
+
    .. code:: console
 
       $ git switch --create <branch-name>
@@ -76,23 +77,23 @@ made in the library use this two commands:
 
 .. _create_pr:
 
-Creating a pull request 
+Creating a pull request
 ==========================
 
 Once you are satisfied with the changes, run the :ref:`tests <testing>`
-and linters and then go ahead and commit the changes.
+and :ref:`linters<styling>` and then go ahead and commit the changes.
 
 3. Add and commit the changes
 
    .. code:: console
-         
+
       $ git add <filenames>
       $ git commit -m "<message>"
 
    Alternatively, you can add and commit in one step, if all the files changed
    are to be committed (-a to add all, -m for message)
-   
-   .. code:: console      
+
+   .. code:: console
 
       $ git commit -am "<message>"
 
@@ -122,9 +123,9 @@ If all is set, you can make the pull request!
    once again the changes you have made.
 
    .. seealso::
-      
+
       Get more details on naming the pull request in Arrow repository
-      and other additional information :ref:`pull_request_and_review`
+      and other additional information :ref:`pull-request-and-review`
       section.
 
 Continuous Integration (CI)
@@ -144,21 +145,21 @@ You will see checks running at the bottom of the pull request page
 on GitHub. In case of an error, click on the details and research the cause
 of the failing build.
 
-.. figure:: ci_process_docs.jpeg
+.. figure:: ../../images/ci_process_docs.jpeg
    :scale: 60 %
    :alt: CI window showing the status of the code checks
          in case of changes made to the documentation.
 
    CI checks for changes made to the documentation.
 
-.. figure:: ci_process_python.jpeg
+.. figure:: ../../images/ci_process_python.jpeg
    :scale: 58 %
    :alt: CI window showing the status of the code checks
          in case of changes made to the python files
 
    CI checks for changes made to the python files.
 
-.. figure:: ci_process_r.jpeg
+.. figure:: ../../images/ci_process_r.jpeg
    :scale: 58 %
    :alt: CI window showing the status of the code checks
          in case of changes made to the R files.
@@ -169,7 +170,7 @@ Besides the CI jobs that check the changes in GitHub repository
 (opening or merging of a pull request) we also use CI for nightly
 builds and releases of the Apache Arrow library.
 
-Also, on-demand triggering jobs can be used in your pull request for
+Also, extended triggering jobs can be used in your pull request for
 example adding a comment with ``@github-actions crossbow submit python``
 will run PyArrow tests via GitHub actions. These are mostly used to run
 tests on environments that are less common and are normally
@@ -188,16 +189,15 @@ that supports quality and with it you can learn a lot.
 
 If it still takes too long to get merged, do not hesitate to remind
 maintainers in the comment section of the pull request and post
-reminders on the JIRA ticket also.
+reminders on the GitHub issue also.
 
 How to get your pull request to be reviewed?
 --------------------------------------------
 
 Arrow maintainers will be notified when a pull request is created and
 they will get to it as soon as possible. If days pass and it still had
-not been reviewed go ahead and mention the reporter of the JIRA issue 
-or a developer that you communicated with via JIRA comments, mailing
-list or GitHub.
+not been reviewed go ahead and mention the reporter of the GitHub issue
+or a developer that you communicated with via mailing list or GitHub.
 
 To put a **mention** in GitHub insert @ in the comment and select the
 username from the list.
@@ -242,8 +242,8 @@ The steps for updating the pull request would then be as follows:
 
       $ git commit -am "<message>" #if all changed files are to be committed
 
-2. **Important!** In case there are commits from other developers on the Pull
-   Request branch or if you committed suggestions from the GitHub you need
+2. **Important!** In case there are commits from other developers on the pull
+   request branch or if you committed suggestions from the GitHub you need
    to update you code with ``origin`` before rebasing! To do this run:
 
    .. code:: console
@@ -252,24 +252,31 @@ The steps for updating the pull request would then be as follows:
 
    Here we merge the new commits with our local branch and we do not rebase.
 
-3. Now we have to update the branch to sync with upstream master Arrow branch.
+3. Now we have to update the branch to sync with upstream main Arrow branch.
    This way the pull request will be able to get merged. We use rebase in this
    case.
 
    .. code:: console
 
-      $ git pull upstream master --rebase
+      $ git pull upstream main --rebase
+
+   This will rebase your local commits on top of the tip of ``upstream/main``.
 
 4. Now you can push the changes by running:
 
    .. code:: console
 
-         $ git push origin <branch-name>
+         $ git push origin <branch-name> --force
+
+   *Note about force pushing to a branch that is being reviewed:* if you want
+   reviewers to look at your updates, please ensure you comment on the PR on
+   GitHub as simply force pushing does not trigger a notification in the
+   GitHub user interface.
 
 .. seealso::
 
-   See more about updating the branch (we use ``rebase``, not ``merge``) in
-   the review process :ref:`here <git_conventions>`. 
+   See more about updating the branch (we use ``rebase``, not ``merge``)
+   and squashing local commits in :ref:`git-conventions`.
 
 If the review process is successful your pull request will get merged.
 

@@ -17,6 +17,8 @@
 
 skip_if_not_available("dataset")
 skip_on_cran()
+# DuckDB 0.7.1-1 may have errors with R<4.0
+skip_on_r_older_than("4.0")
 
 # this test needs to be the first one since all other test blocks are skipped
 # if duckdb is not installed
@@ -32,7 +34,7 @@ test_that("meaningful error message when duckdb is not installed", {
   )
 })
 
-skip_if_not_installed("duckdb", minimum_version = "0.3.1")
+skip_if_not_installed("duckdb", minimum_version = "0.3.2")
 skip_if_not_installed("dbplyr")
 
 library(duckdb, quietly = TRUE)
@@ -48,9 +50,9 @@ test_that("to_duckdb", {
       # factors don't roundtrip https://github.com/duckdb/duckdb/issues/1879
       select(!fct) %>%
       arrange(int),
-      example_data %>%
-        select(!fct) %>%
-        arrange(int)
+    example_data %>%
+      select(!fct) %>%
+      arrange(int)
   )
 
   expect_identical(
@@ -136,9 +138,6 @@ test_that("to_duckdb then to_arrow", {
 })
 
 test_that("to_arrow roundtrip, with dataset", {
-  # these will continue to error until 0.3.2 is released
-  # https://github.com/duckdb/duckdb/pull/2957
-  skip_if_not_installed("duckdb", minimum_version = "0.3.2")
   # With a multi-part dataset
   tf <- tempfile()
   new_ds <- rbind(
@@ -166,14 +165,12 @@ test_that("to_arrow roundtrip, with dataset", {
       filter(int > 5 & part > 1) %>%
       mutate(dbl_plus = dbl + 1) %>%
       collect() %>%
-      arrange(part, int)
+      arrange(part, int) %>%
+      as.data.frame()
   )
 })
 
-test_that("to_arrow roundtrip, with dataset (without wrapping", {
-  # these will continue to error until 0.3.2 is released
-  # https://github.com/duckdb/duckdb/pull/2957
-  skip_if_not_installed("duckdb", minimum_version = "0.3.2")
+test_that("to_arrow roundtrip, with dataset (without wrapping)", {
   # With a multi-part dataset
   tf <- tempfile()
   new_ds <- rbind(
@@ -184,11 +181,11 @@ test_that("to_arrow roundtrip, with dataset (without wrapping", {
   )
   write_dataset(new_ds, tf, partitioning = "part")
 
-  out <- ds %>%
+  out <- open_dataset(tf) %>%
     to_duckdb() %>%
     select(-fct) %>%
     mutate(dbl_plus = dbl + 1) %>%
-    to_arrow(as_arrow_query = FALSE)
+    to_arrow()
 
   expect_r6_class(out, "RecordBatchReader")
 })
@@ -251,11 +248,12 @@ test_that("to_duckdb with a table", {
         int_mean = mean(int, na.rm = TRUE),
         dbl_mean = mean(dbl, na.rm = TRUE)
       ) %>%
-      collect(),
+      collect() %>%
+      arrange(int_mean),
     tibble::tibble(
-      "int > 4" = c(FALSE, NA, TRUE),
-      int_mean = c(2, NA, 7.5),
-      dbl_mean = c(2.1, 4.1, 7.3)
+      "int > 4" = c(FALSE, TRUE, NA),
+      int_mean = c(2, 7.5, NA),
+      dbl_mean = c(2.1, 7.3, 4.1)
     )
   )
 })
@@ -279,7 +277,14 @@ test_that("to_duckdb passing a connection", {
   table_four <- ds %>%
     select(int, lgl, dbl) %>%
     to_duckdb(con = con_separate, auto_disconnect = FALSE)
-  table_four_name <- table_four$ops$x
+
+  # dbplyr 2.3.0 renamed this internal attribute to lazy_query;
+  # and 2.4.0 reserved $... for internal use + changed the identifier class
+  if (packageVersion("dbplyr") < "2.4.0") {
+    table_four_name <- unclass(table_four)$lazy_query$x
+  } else {
+    table_four_name <- unclass(unclass(table_four)$lazy_query$x)$table
+  }
 
   result <- DBI::dbGetQuery(
     con_separate,

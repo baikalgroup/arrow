@@ -25,14 +25,13 @@
 #include "arrow/flight/server.h"
 #include "arrow/flight/sql/example/sqlite_server.h"
 #include "arrow/io/test_common.h"
-#include "arrow/testing/json_integration.h"
 #include "arrow/util/logging.h"
 
 DEFINE_int32(port, 31337, "Server port to listen on");
 
 arrow::Status RunMain() {
-  arrow::flight::Location location;
-  ARROW_CHECK_OK(arrow::flight::Location::ForGrpcTcp("0.0.0.0", FLAGS_port, &location));
+  ARROW_ASSIGN_OR_RAISE(auto location,
+                        arrow::flight::Location::ForGrpcTcp("0.0.0.0", FLAGS_port));
   arrow::flight::FlightServerOptions options(location);
 
   std::shared_ptr<arrow::flight::sql::example::SQLiteFlightSqlServer> server;

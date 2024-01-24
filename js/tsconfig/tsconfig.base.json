@@ -1,5 +1,5 @@
 {
-  "exclude": ["../node_modules"],
+  "exclude": ["../node_modules", "../src/bin/*.ts"],
   "include": ["../src/**/*.ts"],
   "compileOnSave": false,
   "compilerOptions": {
@@ -10,9 +10,8 @@
     },
 
     /* Basic stuff */
-    "moduleResolution": "node",
-    "lib": ["dom", "esnext", "esnext.asynciterable"],
-    "esModuleInterop": true,
+    "moduleResolution": "Node",
+    "lib": ["DOM", "ESNext", "ESNext.AsyncIterable"],
 
     /* Control what is emitted */
     "declaration": true,

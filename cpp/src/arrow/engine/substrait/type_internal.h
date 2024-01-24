@@ -19,10 +19,13 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
 #include <utility>
 
-#include "arrow/engine/substrait/extension_set.h"
-#include "arrow/engine/visibility.h"
+#include "arrow/engine/substrait/type_fwd.h"
+#include "arrow/engine/substrait/visibility.h"
+#include "arrow/result.h"
 #include "arrow/type_fwd.h"
 
 #include "substrait/type.pb.h"  // IWYU pragma: export
@@ -32,18 +35,20 @@ namespace engine {
 
 ARROW_ENGINE_EXPORT
 Result<std::pair<std::shared_ptr<DataType>, bool>> FromProto(const substrait::Type&,
-                                                             const ExtensionSet&);
+                                                             const ExtensionSet&,
+                                                             const ConversionOptions&);
 
 ARROW_ENGINE_EXPORT
 Result<std::unique_ptr<substrait::Type>> ToProto(const DataType&, bool nullable,
-                                                 ExtensionSet*);
+                                                 ExtensionSet*, const ConversionOptions&);
 
 ARROW_ENGINE_EXPORT
 Result<std::shared_ptr<Schema>> FromProto(const substrait::NamedStruct&,
-                                          const ExtensionSet&);
+                                          const ExtensionSet&, const ConversionOptions&);
 
 ARROW_ENGINE_EXPORT
-Result<std::unique_ptr<substrait::NamedStruct>> ToProto(const Schema&, ExtensionSet*);
+Result<std::unique_ptr<substrait::NamedStruct>> ToProto(const Schema&, ExtensionSet*,
+                                                        const ConversionOptions&);
 
 inline std::string TimestampTzTimezoneString() { return "UTC"; }
 

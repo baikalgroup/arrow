@@ -61,55 +61,41 @@ Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
   ARROW_RETURN_IF(configuration == nullptr,
                   Status::Invalid("Configuration cannot be null"));
 
-#ifdef GANDIVA_ENABLE_OBJECT_CODE_CACHE
   // see if equivalent projector was already built
   std::shared_ptr<Cache<ExpressionCacheKey, std::shared_ptr<llvm::MemoryBuffer>>> cache =
       LLVMGenerator::GetCache();
-#else
-  static Cache<ExpressionCacheKey, std::shared_ptr<Projector>> cache;
-#endif
 
   ExpressionCacheKey cache_key(schema, configuration, exprs, selection_vector_mode);
 
-#ifdef GANDIVA_ENABLE_OBJECT_CODE_CACHE
-  auto prev_cached_obj = cache->GetObjectCode(cache_key);
-#else
-  auto prev_cached_obj = cache.GetObjectCode(cache_key);
-#endif
+  bool is_cached = false;
 
-  bool was_cached = false;
+  std::shared_ptr<llvm::MemoryBuffer> prev_cached_obj;
+  prev_cached_obj = cache->GetObjectCode(cache_key);
 
-#ifdef GANDIVA_ENABLE_OBJECT_CODE_CACHE
   // Verify if previous projector obj code was cached
   if (prev_cached_obj != nullptr) {
-    was_cached = true;
+    is_cached = true;
   }
 
   GandivaObjectCache obj_cache(cache, cache_key);
-#else
-  if (prev_cached_obj != nullptr) {
-    *projector = prev_cached_obj;
-    projector->get()->SetBuiltFromCache(true);
-    return Status::OK();
-  }
-#endif
 
   // Build LLVM generator, and generate code for the specified expressions
-  std::unique_ptr<LLVMGenerator> llvm_gen;
-  ARROW_RETURN_NOT_OK(LLVMGenerator::Make(configuration, &llvm_gen));
+  ARROW_ASSIGN_OR_RAISE(auto llvm_gen,
+                        LLVMGenerator::Make(configuration, is_cached, obj_cache));
 
   // Run the validation on the expressions.
   // Return if any of the expression is invalid since
   // we will not be able to process further.
-  ExprValidator expr_validator(llvm_gen->types(), schema);
-  for (auto& expr : exprs) {
-    ARROW_RETURN_NOT_OK(expr_validator.Validate(expr));
+  if (!is_cached) {
+    ExprValidator expr_validator(llvm_gen->types(), schema,
+                                 configuration->function_registry());
+    for (auto& expr : exprs) {
+      ARROW_RETURN_NOT_OK(expr_validator.Validate(expr));
+    }
   }
 
-#ifdef GANDIVA_ENABLE_OBJECT_CODE_CACHE
   // Set the object cache for LLVM
-  llvm_gen->SetLLVMObjectCache(obj_cache);
-#endif
+  ARROW_RETURN_NOT_OK(llvm_gen->SetLLVMObjectCache(obj_cache));
 
   ARROW_RETURN_NOT_OK(llvm_gen->Build(exprs, selection_vector_mode));
 
@@ -123,23 +109,19 @@ Status Projector::Make(SchemaPtr schema, const ExpressionVector& exprs,
   // Instantiate the projector with the completely built llvm generator
   *projector = std::shared_ptr<Projector>(
       new Projector(std::move(llvm_gen), schema, output_fields, configuration));
-  projector->get()->SetBuiltFromCache(was_cached);
-
-#ifndef GANDIVA_ENABLE_OBJECT_CODE_CACHE
-  cache.PutObjectCode(cache_key, *projector);
-#endif
+  projector->get()->SetBuiltFromCache(is_cached);
 
   return Status::OK();
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch,
-                           const ArrayDataVector& output_data_vecs) {
+                           const ArrayDataVector& output_data_vecs) const {
   return Evaluate(batch, nullptr, output_data_vecs);
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch,
                            const SelectionVector* selection_vector,
-                           const ArrayDataVector& output_data_vecs) {
+                           const ArrayDataVector& output_data_vecs) const {
   ARROW_RETURN_NOT_OK(ValidateEvaluateArgsCommon(batch));
 
   if (output_data_vecs.size() != output_fields_.size()) {
@@ -168,13 +150,13 @@ Status Projector::Evaluate(const arrow::RecordBatch& batch,
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch, arrow::MemoryPool* pool,
-                           arrow::ArrayVector* output) {
+                           arrow::ArrayVector* output) const {
   return Evaluate(batch, nullptr, pool, output);
 }
 
 Status Projector::Evaluate(const arrow::RecordBatch& batch,
                            const SelectionVector* selection_vector,
-                           arrow::MemoryPool* pool, arrow::ArrayVector* output) {
+                           arrow::MemoryPool* pool, arrow::ArrayVector* output) const {
   ARROW_RETURN_NOT_OK(ValidateEvaluateArgsCommon(batch));
   ARROW_RETURN_IF(output == nullptr, Status::Invalid("Output must be non-null."));
   ARROW_RETURN_IF(pool == nullptr, Status::Invalid("Memory pool must be non-null."));
@@ -204,7 +186,8 @@ Status Projector::Evaluate(const arrow::RecordBatch& batch,
 
 // TODO : handle complex vectors (list/map/..)
 Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
-                                 arrow::MemoryPool* pool, ArrayDataPtr* array_data) {
+                                 arrow::MemoryPool* pool,
+                                 ArrayDataPtr* array_data) const {
   arrow::Status astatus;
   std::vector<std::shared_ptr<arrow::Buffer>> buffers;
 
@@ -225,7 +208,7 @@ Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
   // The output vector always has a data array.
   int64_t data_len;
   if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
-    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*type);
+    const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*type);
     data_len = arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
   } else if (arrow::is_binary_like(type_id)) {
     // we don't know the expected size for varlen output vectors.
@@ -246,7 +229,7 @@ Status Projector::AllocArrayData(const DataTypePtr& type, int64_t num_records,
   return Status::OK();
 }
 
-Status Projector::ValidateEvaluateArgsCommon(const arrow::RecordBatch& batch) {
+Status Projector::ValidateEvaluateArgsCommon(const arrow::RecordBatch& batch) const {
   ARROW_RETURN_IF(!batch.schema()->Equals(*schema_),
                   Status::Invalid("Schema in RecordBatch must match schema in Make()"));
   ARROW_RETURN_IF(batch.num_rows() == 0,
@@ -257,7 +240,7 @@ Status Projector::ValidateEvaluateArgsCommon(const arrow::RecordBatch& batch) {
 
 Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
                                             const arrow::Field& field,
-                                            int64_t num_records) {
+                                            int64_t num_records) const {
   ARROW_RETURN_IF(array_data.buffers.size() < 2,
                   Status::Invalid("ArrayData must have at least 2 buffers"));
 
@@ -285,7 +268,7 @@ Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
         Status::Invalid("data buffer for varlen output vectors must be resizable"));
   } else if (arrow::is_primitive(type_id) || type_id == arrow::Type::DECIMAL) {
     // verify size of data buffer.
-    const auto& fw_type = dynamic_cast<const arrow::FixedWidthType&>(*field.type());
+    const auto& fw_type = static_cast<const arrow::FixedWidthType&>(*field.type());
     int64_t min_data_len =
         arrow::bit_util::BytesForBits(num_records * fw_type.bit_width());
     int64_t data_len = array_data.buffers[1]->capacity();
@@ -298,7 +281,7 @@ Status Projector::ValidateArrayDataCapacity(const arrow::ArrayData& array_data,
   return Status::OK();
 }
 
-std::string Projector::DumpIR() { return llvm_generator_->DumpIR(); }
+const std::string& Projector::DumpIR() { return llvm_generator_->ir(); }
 
 void Projector::SetBuiltFromCache(bool flag) { built_from_cache_ = flag; }
 

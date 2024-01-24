@@ -22,19 +22,23 @@ FROM ${repo}:${arch}-conda-cpp
 ARG arch=amd64
 ARG maven=3.5
 ARG node=16
+ARG yarn=1.22
 ARG jdk=8
-ARG go=1.15
+ARG go=1.19.13
 
 # Install Archery and integration dependencies
 COPY ci/conda_env_archery.txt /arrow/ci/
-RUN mamba install -q \
+
+# Pin Python until pythonnet is made compatible with 3.12
+# (https://github.com/pythonnet/pythonnet/pull/2249)
+RUN mamba install -q -y \
         --file arrow/ci/conda_env_archery.txt \
-        "python>=3.7" \
+        "python < 3.12" \
         numpy \
         compilers \
         maven=${maven} \
         nodejs=${node} \
-        yarn \
+        yarn=${yarn} \
         openjdk=${jdk} && \
     mamba clean --all --force-pkgs-dirs
 
@@ -52,9 +56,11 @@ RUN wget -nv -O - https://dl.google.com/go/go${go}.linux-${arch}.tar.gz | tar -x
 
 ENV DOTNET_ROOT=/opt/dotnet \
     PATH=/opt/dotnet:$PATH
-RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin -Channel 3.1 -InstallDir /opt/dotnet
+RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin -Channel 7.0 -InstallDir /opt/dotnet
 
-ENV ARROW_BUILD_INTEGRATION=ON \
+ENV ARROW_ACERO=OFF \
+    ARROW_AZURE=OFF \
+    ARROW_BUILD_INTEGRATION=ON \
     ARROW_BUILD_STATIC=OFF \
     ARROW_BUILD_TESTS=OFF \
     ARROW_COMPUTE=OFF \
@@ -62,13 +68,15 @@ ENV ARROW_BUILD_INTEGRATION=ON \
     ARROW_DATASET=OFF \
     ARROW_FILESYSTEM=OFF \
     ARROW_FLIGHT=ON \
+    ARROW_FLIGHT_SQL=ON \
     ARROW_GANDIVA=OFF \
+    ARROW_GCS=OFF \
     ARROW_HDFS=OFF \
     ARROW_JEMALLOC=OFF \
     ARROW_JSON=OFF \
     ARROW_ORC=OFF \
     ARROW_PARQUET=OFF \
-    ARROW_PLASMA=OFF \
     ARROW_S3=OFF \
+    ARROW_SUBSTRAIT=OFF \
     ARROW_USE_GLOG=OFF \
     CMAKE_UNITY_BUILD=ON

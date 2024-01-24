@@ -23,13 +23,17 @@ import (
 	"io"
 	"testing"
 
-	"github.com/apache/arrow/go/v8/arrow/array"
-	"github.com/apache/arrow/go/v8/arrow/flight"
-	"github.com/apache/arrow/go/v8/arrow/internal/arrdata"
-	"github.com/apache/arrow/go/v8/arrow/ipc"
-	"github.com/apache/arrow/go/v8/arrow/memory"
+	"github.com/apache/arrow/go/v15/arrow/array"
+	"github.com/apache/arrow/go/v15/arrow/flight"
+	"github.com/apache/arrow/go/v15/arrow/internal/arrdata"
+	"github.com/apache/arrow/go/v15/arrow/ipc"
+	"github.com/apache/arrow/go/v15/arrow/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
 
@@ -94,7 +98,10 @@ func (f *flightServer) GetSchema(_ context.Context, in *flight.FlightDescriptor)
 }
 
 func (f *flightServer) DoGet(tkt *flight.Ticket, fs flight.FlightService_DoGetServer) error {
-	recs := arrdata.Records[string(tkt.GetTicket())]
+	recs, ok := arrdata.Records[string(tkt.GetTicket())]
+	if !ok {
+		return status.Error(codes.NotFound, "flight not found")
+	}
 
 	w := flight.NewRecordWriter(fs, ipc.WithSchema(recs[0].Schema()))
 	for _, r := range recs {
@@ -108,7 +115,7 @@ type servAuth struct{}
 
 func (a *servAuth) Authenticate(c flight.AuthConn) error {
 	tok, err := c.Read()
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return nil
 	}
 
@@ -156,7 +163,7 @@ func TestListFlights(t *testing.T) {
 	go s.Serve()
 	defer s.Shutdown()
 
-	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithInsecure())
+	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Error(err)
 	}
@@ -169,7 +176,7 @@ func TestListFlights(t *testing.T) {
 
 	for {
 		info, err := flightStream.Recv()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
 			t.Error(err)
@@ -210,7 +217,7 @@ func TestGetSchema(t *testing.T) {
 	go s.Serve()
 	defer s.Shutdown()
 
-	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithInsecure())
+	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Error(err)
 	}
@@ -246,7 +253,7 @@ func TestServer(t *testing.T) {
 	go s.Serve()
 	defer s.Shutdown()
 
-	client, err := flight.NewFlightClient(s.Addr().String(), &clientAuth{}, grpc.WithInsecure())
+	client, err := flight.NewFlightClient(s.Addr().String(), &clientAuth{}, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Error(err)
 	}
@@ -289,7 +296,7 @@ func TestServer(t *testing.T) {
 	for {
 		rec, err := r.Read()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			t.Error(err)
@@ -304,6 +311,44 @@ func TestServer(t *testing.T) {
 
 	if numRows != fi.TotalRecords {
 		t.Fatalf("got %d, want %d", numRows, fi.TotalRecords)
+	}
+}
+
+func TestServerWithAdditionalServices(t *testing.T) {
+	f := &flightServer{}
+	f.SetAuthHandler(&servAuth{})
+
+	s := flight.NewFlightServer()
+	s.Init("localhost:0")
+	s.RegisterFlightService(f)
+
+	// Enable health check.
+	grpc_health_v1.RegisterHealthServer(s, health.NewServer())
+
+	// Enable reflection for grpcurl.
+	reflection.Register(s)
+
+	go s.Serve()
+	defer s.Shutdown()
+
+	// Flight client should not be affected by the additional services.
+	flightClient, err := flight.NewFlightClient(s.Addr().String(), &clientAuth{}, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Error(err)
+	}
+	defer flightClient.Close()
+
+	// Make sure health check is working.
+	conn, err := grpc.Dial(s.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Error(err)
+	}
+	defer conn.Close()
+
+	healthClient := grpc_health_v1.NewHealthClient(conn)
+	_, err = healthClient.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{})
+	if err != nil {
+		t.Error(err)
 	}
 }
 
@@ -331,7 +376,7 @@ func TestFlightWithAppMetadata(t *testing.T) {
 	go s.Serve()
 	defer s.Shutdown()
 
-	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithInsecure())
+	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +397,7 @@ func TestFlightWithAppMetadata(t *testing.T) {
 	for {
 		rec, err := r.Read()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			t.Fatal(err)
@@ -388,7 +433,7 @@ func TestReaderError(t *testing.T) {
 	go s.Serve()
 	defer s.Shutdown()
 
-	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithInsecure())
+	client, err := flight.NewFlightClient(s.Addr().String(), nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}

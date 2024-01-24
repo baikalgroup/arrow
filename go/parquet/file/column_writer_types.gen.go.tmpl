@@ -17,10 +17,12 @@
 package file
 
 import (
-    "github.com/apache/arrow/go/v8/parquet"
-    "github.com/apache/arrow/go/v8/parquet/metadata"
-    "github.com/apache/arrow/go/v8/parquet/internal/encoding"
-    format "github.com/apache/arrow/go/v8/parquet/internal/gen-go/parquet"
+    "fmt"
+
+    "github.com/apache/arrow/go/v15/parquet"
+    "github.com/apache/arrow/go/v15/parquet/metadata"
+    "github.com/apache/arrow/go/v15/parquet/internal/encoding"
+    format "github.com/apache/arrow/go/v15/parquet/internal/gen-go/parquet"
 )
 
 {{range .In}}
@@ -73,7 +75,7 @@ func (w *{{.Name}}ColumnChunkWriter) WriteBatch(values []{{.name}}, defLevels, r
       case error:
         err = r
       default:
-        err = xerrors.Errorf("unknown error type: %s", r)
+        err = fmt.Errorf("unknown error type: %s", r)
       }
     }
   }()
@@ -81,7 +83,7 @@ func (w *{{.Name}}ColumnChunkWriter) WriteBatch(values []{{.name}}, defLevels, r
   // writes a large number of values, the DataPage size can be much above the limit.
   // The purpose of this chunking is to bound this. Even if a user writes large number
   // of values, the chunking will ensure the AddDataPage() is called at a reasonable
-  // pagesize limit  
+  // pagesize limit
   var n int64
   switch {
   case defLevels != nil:
@@ -105,7 +107,7 @@ func (w *{{.Name}}ColumnChunkWriter) WriteBatch(values []{{.name}}, defLevels, r
     valueOffset += toWrite
     w.checkDictionarySizeLimit()
   })
-  return 
+  return
 }
 
 // WriteBatchSpaced writes a batch of repetition levels, definition levels, and values to the
@@ -130,18 +132,18 @@ func (w *{{.Name}}ColumnChunkWriter) WriteBatchSpaced(values []{{.name}}, defLev
     length = len(values)
   }
   doBatches(int64(length), w.props.WriteBatchSize(), func(offset, batch int64) {
-    var vals []{{.name}}    
+    var vals []{{.name}}
     info := w.maybeCalculateValidityBits(levelSliceOrNil(defLevels, offset, batch), batch)
 
     w.writeLevelsSpaced(batch, levelSliceOrNil(defLevels, offset, batch), levelSliceOrNil(repLevels, offset, batch))
     if values != nil {
-      vals = values[valueOffset:]
+      vals = values[valueOffset:valueOffset+info.numSpaced()]
     }
 
     if w.bitsBuffer != nil {
-      w.writeValuesSpaced(vals[:info.numSpaced()], info.batchNum, w.bitsBuffer.Bytes(), 0)
+      w.writeValuesSpaced(vals, info.batchNum, batch, w.bitsBuffer.Bytes(), 0)
     } else {
-      w.writeValuesSpaced(vals[:info.numSpaced()], info.batchNum, validBits, validBitsOffset+valueOffset)
+      w.writeValuesSpaced(vals, info.batchNum, batch, validBits, validBitsOffset+valueOffset)
     }
     w.commitWriteAndCheckPageLimit(batch, info.numSpaced())
     valueOffset += info.numSpaced()
@@ -150,23 +152,83 @@ func (w *{{.Name}}ColumnChunkWriter) WriteBatchSpaced(values []{{.name}}, defLev
   })
 }
 
+func (w *{{.Name}}ColumnChunkWriter) WriteDictIndices(indices arrow.Array, defLevels, repLevels []int16) (err error) {
+  defer func() {
+    if r := recover(); r != nil {
+      switch r := r.(type) {
+      case string:
+        err = errors.New(r)
+      case error:
+        err = r
+      default:
+        err = fmt.Errorf("unknown error type: %s", r)
+      }
+    }
+  }()
+
+  valueOffset := int64(0)
+  length := len(defLevels)
+  if defLevels == nil {
+    length = indices.Len()
+  }
+
+  dictEncoder := w.currentEncoder.(encoding.DictEncoder)
+
+  doBatches(int64(length), w.props.WriteBatchSize(), func(offset, batch int64) {
+    info := w.maybeCalculateValidityBits(levelSliceOrNil(defLevels, offset, batch), batch)
+    w.writeLevelsSpaced(batch, levelSliceOrNil(defLevels, offset, batch), levelSliceOrNil(repLevels, offset, batch))
+
+    writeableIndices := array.NewSlice(indices, valueOffset, valueOffset+info.numSpaced())
+    defer writeableIndices.Release()
+    writeableIndices = w.maybeReplaceValidity(writeableIndices, info.nullCount)
+    defer writeableIndices.Release()
+
+    if err := dictEncoder.PutIndices(writeableIndices); err != nil {
+      panic(err) // caught above
+    }
+
+    if err := w.commitWriteAndCheckPageLimit(batch, info.batchNum); err != nil {
+      panic(err)
+    }
+
+    valueOffset += info.numSpaced()
+  })
+
+  return
+}
 
 func (w *{{.Name}}ColumnChunkWriter) writeValues(values []{{.name}}, numNulls int64) {
   w.currentEncoder.(encoding.{{.Name}}Encoder).Put(values)
   if w.pageStatistics != nil {
+{{- if ne .Name "FixedLenByteArray"}}
     w.pageStatistics.(*metadata.{{.Name}}Statistics).Update(values, numNulls)
+{{- else}}
+    if w.Descr().LogicalType().Equals(schema.Float16LogicalType{}) {
+      w.pageStatistics.(*metadata.Float16Statistics).Update(values, numNulls)
+    } else {
+      w.pageStatistics.(*metadata.{{.Name}}Statistics).Update(values, numNulls)
+    }
+{{- end}}
   }
 }
 
-func (w *{{.Name}}ColumnChunkWriter) writeValuesSpaced(spacedValues []{{.name}}, numValues int64, validBits []byte, validBitsOffset int64) {
-  if len(spacedValues) != int(numValues) {
+func (w *{{.Name}}ColumnChunkWriter) writeValuesSpaced(spacedValues []{{.name}}, numRead, numValues int64, validBits []byte, validBitsOffset int64) {
+  if len(spacedValues) != int(numRead) {
     w.currentEncoder.(encoding.{{.Name}}Encoder).PutSpaced(spacedValues, validBits, validBitsOffset)
   } else {
     w.currentEncoder.(encoding.{{.Name}}Encoder).Put(spacedValues)
   }
   if w.pageStatistics != nil {
-    nulls := int64(len(spacedValues)) - numValues
+    nulls := numValues - numRead
+{{- if ne .Name "FixedLenByteArray"}}
     w.pageStatistics.(*metadata.{{.Name}}Statistics).UpdateSpaced(spacedValues, validBits, validBitsOffset, nulls)
+{{- else}}
+    if w.Descr().LogicalType().Equals(schema.Float16LogicalType{}) {
+      w.pageStatistics.(*metadata.Float16Statistics).UpdateSpaced(spacedValues, validBits, validBitsOffset, nulls)
+    } else {
+      w.pageStatistics.(*metadata.{{.Name}}Statistics).UpdateSpaced(spacedValues, validBits, validBitsOffset, nulls)
+    }
+{{- end}}
   }
 }
 
@@ -176,15 +238,16 @@ func (w *{{.Name}}ColumnChunkWriter) checkDictionarySizeLimit() {
   }
 
   if w.currentEncoder.(encoding.DictEncoder).DictEncodedSize() >= int(w.props.DictionaryPageSizeLimit()) {
-    w.fallbackToPlain()
+    w.FallbackToPlain()
   }
 }
 
-func (w *{{.Name}}ColumnChunkWriter) fallbackToPlain() {
+func (w *{{.Name}}ColumnChunkWriter) FallbackToPlain() {
   if w.currentEncoder.Encoding() == parquet.Encodings.PlainDict {
     w.WriteDictionaryPage()
     w.FlushBufferedDataPages()
     w.fallbackToNonDict = true
+    w.currentEncoder.Release()
     w.currentEncoder = encoding.{{.Name}}EncoderTraits.Encoder(format.Encoding(parquet.Encodings.Plain), false, w.descr, w.mem)
     w.encoding = parquet.Encodings.Plain
   }

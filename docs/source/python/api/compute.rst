@@ -45,6 +45,31 @@ Aggregations
    tdigest
    variance
 
+..
+  Nullary aggregate functions (count_all) aren't exposed in pyarrow.compute,
+  so they aren't listed here.
+
+Cumulative Functions
+--------------------
+
+Cumulative functions are vector functions that perform a running accumulation on 
+their input using a given binary associative operation with an identity element 
+(a monoid) and output an array containing the corresponding intermediate running 
+values. The input is expected to be of numeric type. By default these functions 
+do not detect overflow. They are also
+available in an overflow-checking variant, suffixed ``_checked``, which
+throws an ``ArrowInvalid`` exception when overflow is detected.
+
+.. autosummary::
+   :toctree: ../generated/
+
+   cumulative_sum
+   cumulative_sum_checked
+   cumulative_prod
+   cumulative_prod_checked
+   cumulative_max
+   cumulative_min
+
 Arithmetic Functions
 --------------------
 
@@ -327,6 +352,7 @@ String Slicing
 .. autosummary::
    :toctree: ../generated/
 
+   binary_slice
    utf8_slice_codeunits
 
 Containment Tests
@@ -359,6 +385,7 @@ Categorizations
    is_nan
    is_null
    is_valid
+   true_unless_null
 
 Selecting / Multiplexing
 ------------------------
@@ -381,6 +408,8 @@ Conversions
    ceil_temporal
    floor_temporal
    round_temporal
+   run_end_decode
+   run_end_encode
    strftime
    strptime
 
@@ -439,6 +468,7 @@ Timezone Handling
    :toctree: ../generated/
 
    assume_timezone
+   local_timestamp
 
 Associative Transforms
 ----------------------
@@ -479,16 +509,26 @@ Structural Transforms
 .. autosummary::
    :toctree: ../generated/
 
+   fill_null
    fill_null_backward
    fill_null_forward
    list_element
    list_flatten
    list_parent_indices
+   list_slice
    list_value_length
    make_struct
    map_lookup
    replace_with_mask
    struct_field
+
+Pairwise Functions
+------------------
+
+.. autosummary::
+   :toctree: ../generated/
+
+   pairwise_diff
 
 Compute Options
 ---------------
@@ -501,6 +541,7 @@ Compute Options
    CastOptions
    CountOptions
    CountOptions
+   CumulativeSumOptions
    DayOfWeekOptions
    DictionaryEncodeOptions
    ElementWiseAggregateOptions
@@ -508,12 +549,14 @@ Compute Options
    FilterOptions
    IndexOptions
    JoinOptions
+   ListSliceOptions
    MakeStructOptions
    MapLookupOptions
    MatchSubstringOptions
    ModeOptions
    NullOptions
    PadOptions
+   PairwiseOptions
    PartitionNthOptions
    QuantileOptions
    ReplaceSliceOptions
@@ -521,6 +564,7 @@ Compute Options
    RoundOptions
    RoundTemporalOptions
    RoundToMultipleOptions
+   RunEndEncodeOptions
    ScalarAggregateOptions
    ScalarAggregateOptions
    SelectKOptions
@@ -538,3 +582,12 @@ Compute Options
    TrimOptions
    VarianceOptions
    WeekOptions
+
+User-Defined Functions
+----------------------
+
+.. autosummary::
+   :toctree: ../generated/
+
+   register_scalar_function
+   ScalarUdfContext

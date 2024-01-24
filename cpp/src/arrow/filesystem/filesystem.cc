@@ -60,6 +60,7 @@ using internal::ConcatAbstractPath;
 using internal::EnsureTrailingSlash;
 using internal::GetAbstractPathParent;
 using internal::kSep;
+using internal::ParseFileSystemUri;
 using internal::RemoveLeadingSlash;
 using internal::RemoveTrailingSlash;
 using internal::ToSlashes;
@@ -116,7 +117,8 @@ std::string FileInfo::ToString() const {
 }
 
 std::ostream& operator<<(std::ostream& os, const FileInfo& info) {
-  return os << "FileInfo(" << info.type() << ", " << info.path() << ")";
+  return os << "FileInfo(" << info.type() << ", " << info.path() << ", " << info.size()
+            << ", " << info.mtime().time_since_epoch().count() << ")";
 }
 
 std::string FileInfo::extension() const {
@@ -193,10 +195,12 @@ Status ValidateInputFileInfo(const FileInfo& info) {
 
 }  // namespace
 
-Future<> FileSystem::DeleteDirContentsAsync(const std::string& path) {
-  return FileSystemDefer(
-      this, default_async_is_sync_,
-      [path](std::shared_ptr<FileSystem> self) { return self->DeleteDirContents(path); });
+Future<> FileSystem::DeleteDirContentsAsync(const std::string& path,
+                                            bool missing_dir_ok) {
+  return FileSystemDefer(this, default_async_is_sync_,
+                         [path, missing_dir_ok](std::shared_ptr<FileSystem> self) {
+                           return self->DeleteDirContents(path, missing_dir_ok);
+                         });
 }
 
 Result<std::shared_ptr<io::InputStream>> FileSystem::OpenInputStream(
@@ -251,12 +255,16 @@ Result<std::shared_ptr<io::OutputStream>> FileSystem::OpenAppendStream(
   return OpenAppendStream(path, std::shared_ptr<const KeyValueMetadata>{});
 }
 
+Result<std::string> FileSystem::PathFromUri(const std::string& uri_string) const {
+  return Status::NotImplemented("PathFromUri is not yet supported on this filesystem");
+}
+
 //////////////////////////////////////////////////////////////////////////
 // SubTreeFileSystem implementation
 
 namespace {
 
-Status ValidateSubPath(util::string_view s) {
+Status ValidateSubPath(std::string_view s) {
   if (internal::IsLikelyUri(s)) {
     return Status::Invalid("Expected a filesystem path, got a URI: '", s, "'");
   }
@@ -379,12 +387,13 @@ Status SubTreeFileSystem::DeleteDir(const std::string& path) {
   return base_fs_->DeleteDir(real_path);
 }
 
-Status SubTreeFileSystem::DeleteDirContents(const std::string& path) {
+Status SubTreeFileSystem::DeleteDirContents(const std::string& path,
+                                            bool missing_dir_ok) {
   if (internal::IsEmptyPath(path)) {
     return internal::InvalidDeleteDirContents(path);
   }
   ARROW_ASSIGN_OR_RAISE(auto real_path, PrependBase(path));
-  return base_fs_->DeleteDirContents(real_path);
+  return base_fs_->DeleteDirContents(real_path, missing_dir_ok);
 }
 
 Status SubTreeFileSystem::DeleteRootDirContents() {
@@ -480,12 +489,18 @@ Result<std::shared_ptr<io::OutputStream>> SubTreeFileSystem::OpenAppendStream(
   return base_fs_->OpenAppendStream(real_path, metadata);
 }
 
+Result<std::string> SubTreeFileSystem::PathFromUri(const std::string& uri_string) const {
+  return base_fs_->PathFromUri(uri_string);
+}
+
 //////////////////////////////////////////////////////////////////////////
 // SlowFileSystem implementation
 
 SlowFileSystem::SlowFileSystem(std::shared_ptr<FileSystem> base_fs,
                                std::shared_ptr<io::LatencyGenerator> latencies)
-    : FileSystem(base_fs->io_context()), base_fs_(base_fs), latencies_(latencies) {}
+    : FileSystem(base_fs->io_context()),
+      base_fs_(std::move(base_fs)),
+      latencies_(std::move(latencies)) {}
 
 SlowFileSystem::SlowFileSystem(std::shared_ptr<FileSystem> base_fs,
                                double average_latency)
@@ -500,6 +515,10 @@ SlowFileSystem::SlowFileSystem(std::shared_ptr<FileSystem> base_fs,
       latencies_(io::LatencyGenerator::Make(average_latency, seed)) {}
 
 bool SlowFileSystem::Equals(const FileSystem& other) const { return this == &other; }
+
+Result<std::string> SlowFileSystem::PathFromUri(const std::string& uri_string) const {
+  return base_fs_->PathFromUri(uri_string);
+}
 
 Result<FileInfo> SlowFileSystem::GetFileInfo(const std::string& path) {
   latencies_->Sleep();
@@ -521,9 +540,9 @@ Status SlowFileSystem::DeleteDir(const std::string& path) {
   return base_fs_->DeleteDir(path);
 }
 
-Status SlowFileSystem::DeleteDirContents(const std::string& path) {
+Status SlowFileSystem::DeleteDirContents(const std::string& path, bool missing_dir_ok) {
   latencies_->Sleep();
-  return base_fs_->DeleteDirContents(path);
+  return base_fs_->DeleteDirContents(path, missing_dir_ok);
 }
 
 Status SlowFileSystem::DeleteRootDirContents() {
@@ -635,8 +654,7 @@ Status CopyFiles(const std::shared_ptr<FileSystem>& source_fs,
                              "', which is outside base dir '", source_sel.base_dir, "'");
     }
 
-    auto destination_path =
-        internal::ConcatAbstractPath(destination_base_dir, relative->to_string());
+    auto destination_path = internal::ConcatAbstractPath(destination_base_dir, *relative);
 
     if (source_info.IsDirectory()) {
       dirs.push_back(destination_path);
@@ -658,23 +676,6 @@ Status CopyFiles(const std::shared_ptr<FileSystem>& source_fs,
 
 namespace {
 
-Result<Uri> ParseFileSystemUri(const std::string& uri_string) {
-  Uri uri;
-  auto status = uri.Parse(uri_string);
-  if (!status.ok()) {
-#ifdef _WIN32
-    // Could be a "file:..." URI with backslashes instead of regular slashes.
-    RETURN_NOT_OK(uri.Parse(ToSlashes(uri_string)));
-    if (uri.scheme() != "file") {
-      return status;
-    }
-#else
-    return status;
-#endif
-  }
-  return std::move(uri);
-}
-
 Result<std::shared_ptr<FileSystem>> FileSystemFromUriReal(const Uri& uri,
                                                           const std::string& uri_string,
                                                           const io::IOContext& io_context,
@@ -692,8 +693,7 @@ Result<std::shared_ptr<FileSystem>> FileSystemFromUriReal(const Uri& uri,
   if (scheme == "gs" || scheme == "gcs") {
 #ifdef ARROW_GCS
     ARROW_ASSIGN_OR_RAISE(auto options, GcsOptions::FromUri(uri, out_path));
-    ARROW_ASSIGN_OR_RAISE(auto gcsfs, GcsFileSystem::Make(options, io_context));
-    return gcsfs;
+    return GcsFileSystem::Make(options, io_context);
 #else
     return Status::NotImplemented("Got GCS URI but Arrow compiled without GCS support");
 #endif
@@ -760,7 +760,8 @@ Result<std::shared_ptr<FileSystem>> FileSystemFromUriOrPath(
   if (internal::DetectAbsolutePath(uri_string)) {
     // Normalize path separators
     if (out_path != nullptr) {
-      *out_path = ToSlashes(uri_string);
+      *out_path =
+          std::string(RemoveTrailingSlash(ToSlashes(uri_string), /*preserve_root=*/true));
     }
     return std::make_shared<LocalFileSystem>();
   }

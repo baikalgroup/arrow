@@ -40,7 +40,7 @@
 \alias{fixed_size_list_of}
 \alias{MapType}
 \alias{map_of}
-\title{Apache Arrow data types}
+\title{Create Arrow data types}
 \usage{
 int8()
 
@@ -144,7 +144,7 @@ of digits after the decimal point. It can be negative.}
 sorted.}
 }
 \value{
-An Arrow type object inheriting from DataType.
+An Arrow type object inheriting from \link{DataType}.
 }
 \description{
 These functions create type objects corresponding to Arrow types. Use them
@@ -193,7 +193,7 @@ and power of 10.
 precision. For most use cases, the maximum precision offered by \code{Decimal128Type}
 is sufficient, and it will result in a more compact and more efficient encoding.
 
-#' \code{decimal()} creates either a \code{Decimal128Type} or a \code{Decimal256Type}
+\code{decimal()} creates either a \code{Decimal128Type} or a \code{Decimal256Type}
 depending on the value for \code{precision}. If \code{precision} is greater than 38 a
 \code{Decimal256Type} is returned, otherwise a \code{Decimal128Type}.
 
@@ -201,11 +201,33 @@ Use \code{decimal128()} or \code{decimal256()} as the names are more informative
 \code{decimal()}.
 }
 \examples{
-\dontshow{if (arrow_available()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
+\dontshow{if (arrow_with_acero()) (if (getRversion() >= "3.4") withAutoprint else force)(\{ # examplesIf}
 bool()
 struct(a = int32(), b = double())
 timestamp("ms", timezone = "CEST")
 time64("ns")
+
+# Use the cast method to change the type of data contained in Arrow objects.
+# Please check the documentation of each data object class for details.
+my_scalar <- Scalar$create(0L, type = int64()) # int64
+my_scalar$cast(timestamp("ns")) # timestamp[ns]
+
+my_array <- Array$create(0L, type = int64()) # int64
+my_array$cast(timestamp("s", timezone = "UTC")) # timestamp[s, tz=UTC]
+
+my_chunked_array <- chunked_array(0L, 1L) # int32
+my_chunked_array$cast(date32()) # date32[day]
+
+# You can also use `cast()` in an Arrow dplyr query.
+if (requireNamespace("dplyr", quietly = TRUE)) {
+  library(dplyr, warn.conflicts = FALSE)
+  arrow_table(mtcars) \%>\%
+    transmute(
+      col1 = cast(cyl, string()),
+      col2 = cast(cyl, int8())
+    ) \%>\%
+    compute()
+}
 \dontshow{\}) # examplesIf}
 }
 \seealso{

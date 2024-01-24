@@ -18,17 +18,19 @@ package file_test
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/apache/arrow/go/v8/arrow/memory"
-	"github.com/apache/arrow/go/v8/parquet"
-	"github.com/apache/arrow/go/v8/parquet/compress"
-	"github.com/apache/arrow/go/v8/parquet/file"
-	"github.com/apache/arrow/go/v8/parquet/internal/encoding"
-	"github.com/apache/arrow/go/v8/parquet/internal/testutils"
-	"github.com/apache/arrow/go/v8/parquet/schema"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/compress"
+	"github.com/apache/arrow/go/v15/parquet/file"
+	"github.com/apache/arrow/go/v15/parquet/internal/encoding"
+	"github.com/apache/arrow/go/v15/parquet/internal/testutils"
+	"github.com/apache/arrow/go/v15/parquet/schema"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -95,6 +97,8 @@ func (t *SerializeTestSuite) fileSerializeTest(codec compress.Compression, expec
 	writer.Close()
 
 	nrows := t.numRowGroups * t.rowsPerRG
+	t.EqualValues(nrows, writer.NumRows())
+
 	reader, err := file.NewParquetReader(bytes.NewReader(sink.Bytes()))
 	t.NoError(err)
 	t.Equal(t.numCols, reader.MetaData().Schema.NumColumns())
@@ -115,7 +119,8 @@ func (t *SerializeTestSuite) fileSerializeTest(codec compress.Compression, expec
 			t.False(chunk.HasIndexPage())
 			t.DefLevelsOut = make([]int16, t.rowsPerRG)
 			t.RepLevelsOut = make([]int16, t.rowsPerRG)
-			colReader := rgr.Column(i)
+			colReader, err := rgr.Column(i)
+			t.NoError(err)
 			t.SetupValuesOut(int64(t.rowsPerRG))
 			valuesRead = t.ReadBatch(colReader, int64(t.rowsPerRG), 0, t.DefLevelsOut, t.RepLevelsOut)
 			t.EqualValues(t.rowsPerRG, valuesRead)
@@ -138,7 +143,9 @@ func (t *SerializeTestSuite) unequalNumRows(maxRows int64, rowsPerCol []int64) {
 		t.WriteBatchSubset(int(rowsPerCol[col]), 0, cw, t.DefLevels[:rowsPerCol[col]], nil)
 		cw.Close()
 	}
-	t.Error(rgw.Close())
+	err := rgw.Close()
+	t.Error(err)
+	t.ErrorContains(err, "row mismatch for unbuffered row group")
 }
 
 func (t *SerializeTestSuite) unequalNumRowsBuffered(maxRows int64, rowsPerCol []int64) {
@@ -153,7 +160,9 @@ func (t *SerializeTestSuite) unequalNumRowsBuffered(maxRows int64, rowsPerCol []
 		t.WriteBatchSubset(int(rowsPerCol[col]), 0, cw, t.DefLevels[:rowsPerCol[col]], nil)
 		cw.Close()
 	}
-	t.Error(rgw.Close())
+	err := rgw.Close()
+	t.Error(err)
+	t.ErrorContains(err, "row mismatch for buffered row group")
 }
 
 func (t *SerializeTestSuite) TestZeroRows() {
@@ -310,7 +319,9 @@ func TestBufferedMultiPageDisabledDictionary(t *testing.T) {
 		assert.EqualValues(t, valueCount, rgr.NumRows())
 
 		var totalRead int64
-		colReader := rgr.Column(0).(*file.Int32ColumnChunkReader)
+		col, err := rgr.Column(0)
+		assert.NoError(t, err)
+		colReader := col.(*file.Int32ColumnChunkReader)
 		for colReader.HasNext() {
 			total, _, _ := colReader.ReadBatch(valueCount-totalRead, valuesOut[totalRead:], nil, nil)
 			totalRead += total
@@ -350,7 +361,9 @@ func TestAllNulls(t *testing.T) {
 	assert.NoError(t, err)
 
 	rgr := reader.RowGroup(0)
-	cr := rgr.Column(0).(*file.Int32ColumnChunkReader)
+	col, err := rgr.Column(0)
+	assert.NoError(t, err)
+	cr := col.(*file.Int32ColumnChunkReader)
 
 	defLevels[0] = -1
 	defLevels[1] = -1
@@ -359,6 +372,34 @@ func TestAllNulls(t *testing.T) {
 	assert.EqualValues(t, 3, valRead)
 	assert.EqualValues(t, 0, read)
 	assert.Equal(t, []int16{0, 0, 0}, defLevels[:])
+}
+
+func TestKeyValueMetadata(t *testing.T) {
+	fields := schema.FieldList{
+		schema.NewInt32Node("unused", parquet.Repetitions.Optional, -1),
+	}
+	sc, _ := schema.NewGroupNode("root", parquet.Repetitions.Required, fields, -1)
+	sink := encoding.NewBufferWriter(0, memory.DefaultAllocator)
+
+	writer := file.NewParquetWriter(sink, sc)
+
+	testKey := "testKey"
+	testValue := "testValue"
+	writer.AppendKeyValueMetadata(testKey, testValue)
+	writer.Close()
+
+	buffer := sink.Finish()
+	defer buffer.Release()
+	props := parquet.NewReaderProperties(memory.DefaultAllocator)
+	props.BufferedStreamEnabled = true
+
+	reader, err := file.NewParquetReader(bytes.NewReader(buffer.Bytes()), file.WithReadProps(props))
+	assert.NoError(t, err)
+
+	metadata := reader.MetaData()
+	got := metadata.KeyValueMetadata().FindValue(testKey)
+	require.NotNil(t, got)
+	assert.Equal(t, testValue, *got)
 }
 
 func createSerializeTestSuite(typ reflect.Type) suite.TestingSuite {
@@ -385,4 +426,26 @@ func TestSerialize(t *testing.T) {
 			suite.Run(t, createSerializeTestSuite(tt.typ))
 		})
 	}
+}
+
+type errCloseWriter struct {
+	sink *encoding.BufferWriter
+}
+
+func (c *errCloseWriter) Write(p []byte) (n int, err error) {
+	return c.sink.Write(p)
+}
+func (c *errCloseWriter) Close() error {
+	return fmt.Errorf("error during close")
+}
+func (c *errCloseWriter) Bytes() []byte {
+	return c.sink.Bytes()
+}
+
+func TestCloseError(t *testing.T) {
+	fields := schema.FieldList{schema.NewInt32Node("col", parquet.Repetitions.Required, 1)}
+	sc, _ := schema.NewGroupNode("schema", parquet.Repetitions.Required, fields, 0)
+	sink := &errCloseWriter{sink: encoding.NewBufferWriter(0, memory.DefaultAllocator)}
+	writer := file.NewParquetWriter(sink, sc)
+	assert.Error(t, writer.Close())
 }

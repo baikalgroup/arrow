@@ -17,13 +17,14 @@
 package arrjson
 
 import (
-	"encoding/json"
 	"io"
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/arrio"
-	"github.com/apache/arrow/go/v8/arrow/internal/debug"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/arrio"
+	"github.com/apache/arrow/go/v15/arrow/internal/debug"
+	"github.com/apache/arrow/go/v15/arrow/internal/dictutils"
+	"github.com/apache/arrow/go/v15/internal/json"
 )
 
 type Reader struct {
@@ -31,6 +32,7 @@ type Reader struct {
 
 	schema *arrow.Schema
 	recs   []arrow.Record
+	memo   *dictutils.Memo
 
 	irec int // current record index. used for the arrio.Reader interface.
 }
@@ -49,11 +51,14 @@ func NewReader(r io.Reader, opts ...Option) (*Reader, error) {
 		opt(cfg)
 	}
 
-	schema := schemaFromJSON(raw.Schema)
+	memo := dictutils.NewMemo()
+	schema := schemaFromJSON(raw.Schema, &memo)
+	dictionariesFromJSON(cfg.alloc, raw.Dictionaries, &memo)
 	rr := &Reader{
 		refs:   1,
 		schema: schema,
-		recs:   recordsFromJSON(cfg.alloc, schema, raw.Records),
+		recs:   recordsFromJSON(cfg.alloc, schema, raw.Records, &memo),
+		memo:   &memo,
 	}
 	return rr, nil
 }
@@ -77,6 +82,8 @@ func (r *Reader) Release() {
 				r.recs[i] = nil
 			}
 		}
+		r.memo.Clear()
+		r.memo = nil
 	}
 }
 func (r *Reader) Schema() *arrow.Schema { return r.schema }
@@ -88,6 +95,14 @@ func (r *Reader) Read() (arrow.Record, error) {
 	}
 	rec := r.recs[r.irec]
 	r.irec++
+	return rec, nil
+}
+
+func (r *Reader) ReadAt(index int) (arrow.Record, error) {
+	if index >= r.NumRecords() {
+		return nil, io.EOF
+	}
+	rec := r.recs[index]
 	return rec, nil
 }
 

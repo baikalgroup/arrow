@@ -23,48 +23,50 @@
 #include "arrow/extension_type.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
-#include "arrow/util/bit_block_counter.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/decimal.h"
-#include "arrow/util/int_util_internal.h"
+#include "arrow/util/int_util_overflow.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/ree_util.h"
+#include "arrow/util/sort.h"
+#include "arrow/util/string.h"
+#include "arrow/util/unreachable.h"
 #include "arrow/util/utf8.h"
 #include "arrow/visit_data_inline.h"
 #include "arrow/visit_type_inline.h"
 
-namespace arrow {
-namespace internal {
+namespace arrow::internal {
 
 namespace {
 
 struct UTF8DataValidator {
   const ArrayData& data;
 
-  Status Visit(const DataType&) {
-    // Default, should be unreachable
-    return Status::NotImplemented("");
-  }
+  template <typename T>
+  Status Visit(const T&) {
+    if constexpr (std::is_same_v<T, StringType> || std::is_same_v<T, LargeStringType> ||
+                  std::is_same_v<T, StringViewType>) {
+      util::InitializeUTF8();
 
-  template <typename StringType>
-  enable_if_string<StringType, Status> Visit(const StringType&) {
-    util::InitializeUTF8();
-
-    int64_t i = 0;
-    return VisitArrayDataInline<StringType>(
-        data,
-        [&](util::string_view v) {
-          if (ARROW_PREDICT_FALSE(!util::ValidateUTF8(v))) {
-            return Status::Invalid("Invalid UTF8 sequence at string index ", i);
-          }
-          ++i;
-          return Status::OK();
-        },
-        [&]() {
-          ++i;
-          return Status::OK();
-        });
+      int64_t i = 0;
+      return VisitArraySpanInline<T>(
+          data,
+          [&](std::string_view v) {
+            if (ARROW_PREDICT_FALSE(!util::ValidateUTF8(v))) {
+              return Status::Invalid("Invalid UTF8 sequence at string index ", i);
+            }
+            ++i;
+            return Status::OK();
+          },
+          [&]() {
+            ++i;
+            return Status::OK();
+          });
+    } else {
+      Unreachable("utf-8 validation of non string type");
+    }
   }
 };
 
@@ -83,7 +85,7 @@ struct BoundsChecker {
     using c_type = typename IntegerType::c_type;
 
     int64_t i = 0;
-    return VisitArrayDataInline<IntegerType>(
+    return VisitArraySpanInline<IntegerType>(
         data,
         [&](c_type value) {
           const auto v = static_cast<int64_t>(value);
@@ -168,12 +170,20 @@ struct ValidateArrayImpl {
     return Status::OK();
   }
 
+  Status Visit(const StringViewType& type) {
+    RETURN_NOT_OK(ValidateBinaryView(type));
+    if (full_validation) {
+      RETURN_NOT_OK(ValidateUTF8(data));
+    }
+    return Status::OK();
+  }
+
   Status Visit(const Date64Type& type) {
     RETURN_NOT_OK(ValidateFixedWidthBuffers());
 
     if (full_validation) {
       using c_type = typename Date64Type::c_type;
-      return VisitArrayDataInline<Date64Type>(
+      return VisitArraySpanInline<Date64Type>(
           data,
           [&](c_type date) {
             constexpr c_type kFullDayMillis = 1000 * 60 * 60 * 24;
@@ -193,7 +203,7 @@ struct ValidateArrayImpl {
 
     if (full_validation) {
       using c_type = typename Time32Type::c_type;
-      return VisitArrayDataInline<Time32Type>(
+      return VisitArraySpanInline<Time32Type>(
           data,
           [&](c_type time) {
             constexpr c_type kFullDaySeconds = 60 * 60 * 24;
@@ -221,7 +231,7 @@ struct ValidateArrayImpl {
 
     if (full_validation) {
       using c_type = typename Time64Type::c_type;
-      return VisitArrayDataInline<Time64Type>(
+      return VisitArraySpanInline<Time64Type>(
           data,
           [&](c_type time) {
             constexpr c_type kFullDayMicro = 1000000LL * 60 * 60 * 24;
@@ -247,6 +257,8 @@ struct ValidateArrayImpl {
 
   Status Visit(const LargeBinaryType& type) { return ValidateBinaryLike(type); }
 
+  Status Visit(const BinaryViewType& type) { return ValidateBinaryView(type); }
+
   Status Visit(const ListType& type) { return ValidateListLike(type); }
 
   Status Visit(const LargeListType& type) { return ValidateListLike(type); }
@@ -255,6 +267,9 @@ struct ValidateArrayImpl {
     RETURN_NOT_OK(ValidateListLike(type));
     return MapArray::ValidateChildData(data.child_data);
   }
+
+  Status Visit(const ListViewType& type) { return ValidateListView(type); }
+  Status Visit(const LargeListViewType& type) { return ValidateListView(type); }
 
   Status Visit(const FixedSizeListType& type) {
     const ArrayData& values = *data.child_data[0];
@@ -413,6 +428,20 @@ struct ValidateArrayImpl {
     return Status::OK();
   }
 
+  Status Visit(const RunEndEncodedType& type) {
+    switch (type.run_end_type()->id()) {
+      case Type::INT16:
+        return ValidateRunEndEncoded<int16_t>(type);
+      case Type::INT32:
+        return ValidateRunEndEncoded<int32_t>(type);
+      case Type::INT64:
+        return ValidateRunEndEncoded<int64_t>(type);
+      default:
+        return Status::Invalid("Run end type must be int16, int32 or int64, but got: ",
+                               type.run_end_type()->ToString());
+    }
+  }
+
   Status Visit(const ExtensionType& type) {
     // Visit storage
     return ValidateWithType(*type.storage_type());
@@ -438,11 +467,16 @@ struct ValidateArrayImpl {
       return Status::Invalid("Array length is negative");
     }
 
-    if (data.buffers.size() != layout.buffers.size()) {
+    if (layout.variadic_spec) {
+      if (data.buffers.size() < layout.buffers.size()) {
+        return Status::Invalid("Expected at least ", layout.buffers.size(),
+                               " buffers in array of type ", type.ToString(), ", got ",
+                               data.buffers.size());
+      }
+    } else if (data.buffers.size() != layout.buffers.size()) {
       return Status::Invalid("Expected ", layout.buffers.size(),
-                             " buffers in array "
-                             "of type ",
-                             type.ToString(), ", got ", data.buffers.size());
+                             " buffers in array of type ", type.ToString(), ", got ",
+                             data.buffers.size());
     }
 
     // This check is required to avoid addition overflow below
@@ -454,19 +488,24 @@ struct ValidateArrayImpl {
 
     for (int i = 0; i < static_cast<int>(data.buffers.size()); ++i) {
       const auto& buffer = data.buffers[i];
-      const auto& spec = layout.buffers[i];
+      const auto& spec = i < static_cast<int>(layout.buffers.size())
+                             ? layout.buffers[i]
+                             : *layout.variadic_spec;
 
       if (buffer == nullptr) {
         continue;
       }
-      int64_t min_buffer_size = -1;
+      int64_t min_buffer_size = 0;
       switch (spec.kind) {
         case DataTypeLayout::BITMAP:
-          min_buffer_size = bit_util::BytesForBits(length_plus_offset);
+          // If length == 0, buffer size can be 0 regardless of offset
+          if (data.length > 0) {
+            min_buffer_size = bit_util::BytesForBits(length_plus_offset);
+          }
           break;
         case DataTypeLayout::FIXED_WIDTH:
-          if (MultiplyWithOverflow(length_plus_offset, spec.byte_width,
-                                   &min_buffer_size)) {
+          if (data.length > 0 && MultiplyWithOverflow(length_plus_offset, spec.byte_width,
+                                                      &min_buffer_size)) {
             return Status::Invalid("Array of type ", type.ToString(),
                                    " has impossibly large length and offset");
           }
@@ -545,7 +584,7 @@ struct ValidateArrayImpl {
     const Buffer& values = *data.buffers[2];
 
     // First validate offsets, to make sure the accesses below are valid
-    RETURN_NOT_OK(ValidateOffsets(type, values.size()));
+    RETURN_NOT_OK(ValidateOffsetsAndSizes(type, values.size()));
 
     if (data.length > 0 && data.buffers[1]->is_cpu()) {
       using offset_type = typename BinaryType::offset_type;
@@ -577,6 +616,85 @@ struct ValidateArrayImpl {
     return Status::OK();
   }
 
+  Status ValidateBinaryView(const BinaryViewType& type) {
+    int64_t views_byte_size = data.buffers[1]->size();
+    int64_t required_view_count = data.length + data.offset;
+    if (static_cast<int64_t>(views_byte_size / BinaryViewType::kSize) <
+        required_view_count) {
+      return Status::Invalid("View buffer size (bytes): ", views_byte_size,
+                             " isn't large enough for length: ", data.length,
+                             " and offset: ", data.offset);
+    }
+
+    if (!full_validation) return Status::OK();
+
+    auto CheckPrefix = [&](size_t i,
+                           std::array<uint8_t, BinaryViewType::kPrefixSize> prefix,
+                           const uint8_t* data) {
+      if (std::memcmp(data, prefix.data(), BinaryViewType::kPrefixSize) == 0) {
+        return Status::OK();
+      }
+      return Status::Invalid("View at slot ", i, " has inlined prefix 0x",
+                             HexEncode(prefix.data(), BinaryViewType::kPrefixSize),
+                             " but the out-of-line data begins with 0x",
+                             HexEncode(data, BinaryViewType::kPrefixSize));
+    };
+
+    util::span views(data.GetValues<BinaryViewType::c_type>(1),
+                     static_cast<size_t>(data.length));
+    util::span data_buffers(data.buffers.data() + 2, data.buffers.size() - 2);
+
+    for (size_t i = 0; i < static_cast<size_t>(data.length); ++i) {
+      if (data.IsNull(i)) continue;
+
+      if (views[i].size() < 0) {
+        return Status::Invalid("View at slot ", i, " has negative size ",
+                               views[i].size());
+      }
+
+      if (views[i].is_inline()) {
+        auto padding_bytes = util::span(views[i].inlined.data).subspan(views[i].size());
+        for (auto padding_byte : padding_bytes) {
+          if (padding_byte != 0) {
+            return Status::Invalid("View at slot ", i, " was inline with size ",
+                                   views[i].size(),
+                                   " but its padding bytes were not all zero: ",
+                                   HexEncode(padding_bytes.data(), padding_bytes.size()));
+          }
+        }
+        continue;
+      }
+
+      auto [size, prefix, buffer_index, offset] = views[i].ref;
+
+      if (buffer_index < 0) {
+        return Status::Invalid("View at slot ", i, " has negative buffer index ",
+                               buffer_index);
+      }
+
+      if (offset < 0) {
+        return Status::Invalid("View at slot ", i, " has negative offset ", offset);
+      }
+
+      if (static_cast<size_t>(buffer_index) >= data_buffers.size()) {
+        return Status::IndexError("View at slot ", i, " references buffer ", buffer_index,
+                                  " but there are only ", data_buffers.size(),
+                                  " data buffers");
+      }
+      const auto& buffer = data_buffers[buffer_index];
+
+      if (int64_t end = offset + static_cast<int64_t>(size); end > buffer->size()) {
+        return Status::IndexError(
+            "View at slot ", i, " references range ", offset, "-", end, " of buffer ",
+            buffer_index, " but that buffer is only ", buffer->size(), " bytes long");
+      }
+
+      RETURN_NOT_OK(CheckPrefix(i, prefix, buffer->data() + offset));
+    }
+
+    return Status::OK();
+  }
+
   template <typename ListType>
   Status ValidateListLike(const ListType& type) {
     const ArrayData& values = *data.child_data[0];
@@ -586,7 +704,7 @@ struct ValidateArrayImpl {
     }
 
     // First validate offsets, to make sure the accesses below are valid
-    RETURN_NOT_OK(ValidateOffsets(type, values.offset + values.length));
+    RETURN_NOT_OK(ValidateOffsetsAndSizes(type, values.offset + values.length));
 
     // An empty list array can have 0 offsets
     if (data.length > 0 && data.buffers[1]->is_cpu()) {
@@ -619,50 +737,201 @@ struct ValidateArrayImpl {
     return Status::OK();
   }
 
-  template <typename TypeClass>
-  Status ValidateOffsets(const TypeClass& type, int64_t offset_limit) {
-    using offset_type = typename TypeClass::offset_type;
+  template <typename ListViewType>
+  Status ValidateListView(const ListViewType& type) {
+    const ArrayData& values = *data.child_data[0];
+    const Status child_valid = RecurseInto(values);
+    if (!child_valid.ok()) {
+      return Status::Invalid("List-view child array is invalid: ",
+                             child_valid.ToString());
+    }
+    // For list-views, sizes are validated together with offsets.
+    return ValidateOffsetsAndSizes(type, /*offset_limit=*/values.length);
+  }
 
-    if (!IsBufferValid(1)) {
-      // For length 0, an empty offsets buffer seems accepted as a special case
-      // (ARROW-544)
-      if (data.length > 0) {
-        return Status::Invalid("Non-empty array but offsets are null");
-      }
+  template <typename RunEndCType>
+  Status ValidateRunEndEncoded(const RunEndEncodedType& type) {
+    if (data.child_data.size() != 2) {
+      return Status::Invalid(
+          "Run end encoded array should have 2 children; this array has ",
+          data.child_data.size());
+    }
+
+    if (data.buffers.size() > 0 && data.buffers[0] != nullptr) {
+      return Status::Invalid("Run end encoded array should not have a null bitmap.");
+    }
+
+    const auto& run_ends_data = data.child_data[0];
+    const auto& values_data = data.child_data[1];
+
+    if (!run_ends_data) {
+      return Status::Invalid("Run ends array is null pointer");
+    }
+    if (!values_data) {
+      return Status::Invalid("Values array is null pointer");
+    }
+    // We must validate child array buffers are valid before making additional checks.
+    const Status run_ends_valid = RecurseInto(*run_ends_data);
+    if (!run_ends_valid.ok()) {
+      return Status::Invalid("Run ends array invalid: ", run_ends_valid.message());
+    }
+    const Status values_valid = RecurseInto(*values_data);
+    if (!values_valid.ok()) {
+      return Status::Invalid("Values array invalid: ", values_valid.message());
+    }
+
+    RETURN_NOT_OK(ree_util::ValidateRunEndEncodedChildren(
+        type, data.length, run_ends_data, values_data, data.GetNullCount(), data.offset));
+
+    if (run_ends_data->length == 0) {
       return Status::OK();
     }
 
-    // An empty list array can have 0 offsets
-    const auto required_offsets = (data.length > 0) ? data.length + data.offset + 1 : 0;
+    if (full_validation) {
+      ArraySpan span(data);
+      const auto* run_ends = ree_util::RunEnds<RunEndCType>(span);
+      const int64_t run_ends_length = ree_util::RunEndsArray(span).length;
+      if (run_ends[0] < 1) {
+        return Status::Invalid(
+            "All run ends must be greater than 0 but the first run end is ", run_ends[0]);
+      }
+      int64_t last_run_end = run_ends[0];
+      for (int64_t index = 1; index < run_ends_length; index++) {
+        const int64_t run_end = run_ends[index];
+        if (run_end <= last_run_end) {
+          return Status::Invalid(
+              "Every run end must be strictly greater than the previous run end, "
+              "but run_ends[",
+              index, "] is ", run_end, " and run_ends[", index - 1, "] is ",
+              last_run_end);
+        }
+        last_run_end = run_end;
+      }
+    }
+    return Status::OK();
+  }
+
+ private:
+  /// \pre basic validation has already been performed
+  template <typename offset_type>
+  Status FullyValidateOffsets(int64_t offset_limit) {
+    const auto* offsets = data.GetValues<offset_type>(1);
+    auto prev_offset = offsets[0];
+    if (prev_offset < 0) {
+      return Status::Invalid("Offset invariant failure: array starts at negative offset ",
+                             prev_offset);
+    }
+    for (int64_t i = 1; i <= data.length; ++i) {
+      const auto current_offset = offsets[i];
+      if (current_offset < prev_offset) {
+        return Status::Invalid("Offset invariant failure: non-monotonic offset at slot ",
+                               i, ": ", current_offset, " < ", prev_offset);
+      }
+      if (current_offset > offset_limit) {
+        return Status::Invalid("Offset invariant failure: offset for slot ", i,
+                               " out of bounds: ", current_offset, " > ", offset_limit);
+      }
+      prev_offset = current_offset;
+    }
+    return Status::OK();
+  }
+
+  template <typename offset_type>
+  Status OutOfBoundsListViewOffset(int64_t slot, int64_t offset_limit) {
+    const auto* offsets = data.GetValues<offset_type>(1);
+    const auto offset = offsets[slot];
+    return Status::Invalid("Offset invariant failure: offset for slot ", slot,
+                           " out of bounds. Expected ", offset,
+                           " to be at least 0 and less than ", offset_limit);
+  }
+
+  template <typename offset_type>
+  Status OutOfBoundsListViewSize(int64_t slot, int64_t offset_limit) {
+    const auto* offsets = data.GetValues<offset_type>(1);
+    const auto* sizes = data.GetValues<offset_type>(2);
+    const auto size = sizes[slot];
+    if (size < 0) {
+      return Status::Invalid("Offset invariant failure: size for slot ", slot,
+                             " out of bounds: ", size, " < 0");
+    } else {
+      const auto offset = offsets[slot];
+      return Status::Invalid("Offset invariant failure: size for slot ", slot,
+                             " out of bounds: ", offset, " + ", size, " > ",
+                             offset_limit);
+    }
+  }
+
+  /// \pre basic validation has already been performed
+  template <typename offset_type>
+  Status FullyValidateOffsetsAndSizes(int64_t offset_limit) {
+    const auto* offsets = data.GetValues<offset_type>(1);
+    const auto* sizes = data.GetValues<offset_type>(2);
+
+    for (int64_t i = 0; i < data.length; ++i) {
+      const auto size = sizes[i];
+      if (size >= 0) {
+        const auto offset = offsets[i];
+        if (offset < 0 || offset > offset_limit) {
+          return OutOfBoundsListViewOffset<offset_type>(i, offset_limit);
+        }
+        if (size > offset_limit - offset) {
+          return OutOfBoundsListViewSize<offset_type>(i, offset_limit);
+        }
+      } else {
+        return OutOfBoundsListViewSize<offset_type>(i, offset_limit);
+      }
+    }
+
+    return Status::OK();
+  }
+
+ public:
+  template <typename TypeClass>
+  Status ValidateOffsetsAndSizes(const TypeClass&, int64_t offset_limit) {
+    using offset_type = typename TypeClass::offset_type;
+    constexpr bool is_list_view = is_list_view_type<TypeClass>::value;
+
+    const bool non_empty = data.length > 0;
+    if constexpr (is_list_view) {
+      if (!IsBufferValid(1)) {
+        return Status::Invalid("offsets buffer is null");
+      }
+      if (!IsBufferValid(2)) {
+        return Status::Invalid("sizes buffer is null");
+      }
+    } else {
+      if (!IsBufferValid(1)) {
+        // For length 0, an empty offsets buffer is accepted (ARROW-544).
+        return non_empty ? Status::Invalid("Non-empty array but offsets are null")
+                         : Status::OK();
+      }
+    }
+
     const auto offsets_byte_size = data.buffers[1]->size();
+    const auto required_offsets = ((data.length > 0) || (offsets_byte_size > 0))
+                                      ? data.length + data.offset + (is_list_view ? 0 : 1)
+                                      : 0;
     if (offsets_byte_size / static_cast<int32_t>(sizeof(offset_type)) <
         required_offsets) {
       return Status::Invalid("Offsets buffer size (bytes): ", offsets_byte_size,
                              " isn't large enough for length: ", data.length,
                              " and offset: ", data.offset);
     }
+    if constexpr (is_list_view) {
+      const auto required_sizes = data.length + data.offset;
+      const auto sizes_bytes_size = data.buffers[2]->size();
+      if (sizes_bytes_size / static_cast<int32_t>(sizeof(offset_type)) < required_sizes) {
+        return Status::Invalid("Sizes buffer size (bytes): ", sizes_bytes_size,
+                               " isn't large enough for length: ", data.length,
+                               " and offset: ", data.offset);
+      }
+    }
 
     if (full_validation && required_offsets > 0) {
-      // Validate all offset values
-      const offset_type* offsets = data.GetValues<offset_type>(1);
-
-      auto prev_offset = offsets[0];
-      if (prev_offset < 0) {
-        return Status::Invalid(
-            "Offset invariant failure: array starts at negative offset ", prev_offset);
-      }
-      for (int64_t i = 1; i <= data.length; ++i) {
-        const auto current_offset = offsets[i];
-        if (current_offset < prev_offset) {
-          return Status::Invalid(
-              "Offset invariant failure: non-monotonic offset at slot ", i, ": ",
-              current_offset, " < ", prev_offset);
-        }
-        if (current_offset > offset_limit) {
-          return Status::Invalid("Offset invariant failure: offset for slot ", i,
-                                 " out of bounds: ", current_offset, " > ", offset_limit);
-        }
-        prev_offset = current_offset;
+      if constexpr (is_list_view) {
+        return FullyValidateOffsetsAndSizes<offset_type>(offset_limit);
+      } else {
+        return FullyValidateOffsets<offset_type>(offset_limit);
       }
     }
     return Status::OK();
@@ -673,9 +942,9 @@ struct ValidateArrayImpl {
     using CType = typename TypeTraits<DecimalType>::CType;
     if (full_validation) {
       const int32_t precision = type.precision();
-      return VisitArrayDataInline<DecimalType>(
+      return VisitArraySpanInline<DecimalType>(
           data,
-          [&](util::string_view bytes) {
+          [&](std::string_view bytes) {
             DCHECK_EQ(bytes.size(), DecimalType::kByteWidth);
             CType value(reinterpret_cast<const uint8_t*>(bytes.data()));
             if (!value.FitsInPrecision(precision)) {
@@ -716,7 +985,8 @@ Status ValidateArrayFull(const Array& array) { return ValidateArrayFull(*array.d
 
 ARROW_EXPORT
 Status ValidateUTF8(const ArrayData& data) {
-  DCHECK(data.type->id() == Type::STRING || data.type->id() == Type::LARGE_STRING);
+  DCHECK(data.type->id() == Type::STRING || data.type->id() == Type::STRING_VIEW ||
+         data.type->id() == Type::LARGE_STRING);
   UTF8DataValidator validator{data};
   return VisitTypeInline(*data.type, &validator);
 }
@@ -724,5 +994,4 @@ Status ValidateUTF8(const ArrayData& data) {
 ARROW_EXPORT
 Status ValidateUTF8(const Array& array) { return ValidateUTF8(*array.data()); }
 
-}  // namespace internal
-}  // namespace arrow
+}  // namespace arrow::internal

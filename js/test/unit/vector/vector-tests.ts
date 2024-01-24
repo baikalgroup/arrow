@@ -16,7 +16,7 @@
 // under the License.
 
 import {
-    DateDay, DateMillisecond, Dictionary, Field, Int32, List, makeVector, Utf8, util, Vector, vectorFromArray
+    Bool, DateDay, DateMillisecond, Dictionary, Float64, Int32, List, makeVector, Struct, Timestamp, TimeUnit, Utf8, LargeUtf8, util, Vector, vectorFromArray
 } from 'apache-arrow';
 
 describe(`makeVectorFromArray`, () => {
@@ -30,6 +30,51 @@ describe(`makeVectorFromArray`, () => {
         test(`toJSON retains null`, () => {
             expect(vector.toJSON()).toEqual(values);
         });
+    });
+});
+
+describe(`StructVector`, () => {
+    test(`makeVectorFromArray`, () => {
+        const values: { a?: number; b?: string | null; c?: boolean | null }[] = [
+            { a: 1, b: null },
+            { a: 4, b: 'foo', c: null },
+            { a: 7, b: 'bar', c: true },
+            { a: 10, b: 'baz', c: true },
+        ];
+        const vector = vectorFromArray(values);
+
+        expect(vector.numChildren).toBe(3);
+        expect(vector).toHaveLength(4);
+        expect(vector.type.children[0].type).toBeInstanceOf(Float64);
+        expect(vector.type.children[1].type).toBeInstanceOf(Dictionary);
+        expect(vector.type.children[2].type).toBeInstanceOf(Bool);
+    });
+
+
+    const values: { a?: number; b?: string; c?: boolean }[] = [
+        { a: 1, b: 'foo', c: true },
+        { a: 4, b: 'foo', c: false },
+        { a: 7, b: 'bar', c: true },
+        { a: 10, b: 'baz', c: true },
+    ];
+    const vector = vectorFromArray(values);
+
+    test(`has list struct`, () => {
+        expect(vector.type).toBeInstanceOf(Struct);
+
+        expect(vector.type.children[0].type).toBeInstanceOf(Float64);
+        expect(vector.type.children[1].type).toBeInstanceOf(Dictionary);
+        expect(vector.type.children[2].type).toBeInstanceOf(Bool);
+
+        expect(vector.type.children[0].nullable).toBeTruthy();
+        expect(vector.type.children[1].nullable).toBeTruthy();
+        expect(vector.type.children[2].nullable).toBeTruthy();
+    });
+
+    test(`get value`, () => {
+        for (const [i, value] of values.entries()) {
+            expect(vector.get(i)!.toJSON()).toEqual(value);
+        }
     });
 });
 
@@ -151,9 +196,31 @@ describe(`Utf8Vector`, () => {
     });
 });
 
+describe(`LargeUtf8Vector`, () => {
+    const values = ['foo', 'bar', 'baz', 'foo bar', 'bar'];
+    const vector = vectorFromArray(values, new LargeUtf8);
+
+    test(`has largeUtf8 type`, () => {
+        expect(vector.type).toBeInstanceOf(LargeUtf8);
+    });
+
+    test(`is not memoized`, () => {
+        expect(vector.isMemoized).toBe(false);
+        const memoizedVector = vector.memoize();
+        expect(memoizedVector.isMemoized).toBe(true);
+        const unMemoizedVector = vector.unmemoize();
+        expect(unMemoizedVector.isMemoized).toBe(false);
+    });
+
+    basicVectorTests(vector, values, ['abc', '123']);
+    describe(`sliced`, () => {
+        basicVectorTests(vector.slice(1, 3), values.slice(1, 3), ['foo', 'abc']);
+    });
+});
+
 describe(`ListVector`, () => {
     const values = [[1, 2], [1, 2, 3]];
-    const vector = vectorFromArray(values, new List(Field.new({ name: 'field', type: new Int32 })));
+    const vector = vectorFromArray(values);
 
     test(`has list type`, () => {
         expect(vector.type).toBeInstanceOf(List);
@@ -163,6 +230,34 @@ describe(`ListVector`, () => {
         for (const [i, value] of values.entries()) {
             expect(vector.get(i)!.toJSON()).toEqual(value);
         }
+    });
+});
+
+describe(`toArray()`, () => {
+    test(`when some data blobs have been padded`, () => {
+        const d1 = vectorFromArray([...new Array(16).keys()]);
+        const d2 = vectorFromArray([...new Array(10).keys()]);
+
+        // Padding has been added
+        expect(d2.length).toBeLessThan(d2.data[0].buffers[1].length);
+
+        const vector = new Vector([d1, d2]);
+
+        // This used to crash with "RangeError: offset is out of bounds"
+        // https://issues.apache.org/jira/browse/ARROW-18247
+        const array = vector.toArray();
+        expect(array).toHaveLength(26);
+    });
+
+    test(`when stride is 2`, () => {
+        let d1 = vectorFromArray([0, 1, 2], new Timestamp(TimeUnit.MILLISECOND)).data[0];
+        let d2 = vectorFromArray([3, 4, 5], new Timestamp(TimeUnit.MILLISECOND)).data[0];
+
+        const vector = new Vector([d1, d2]);
+
+        let array = Array.from(vector.toArray());
+        expect(array).toHaveLength(6 * 2);
+        expect(Array.from(array)).toMatchObject([0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0]);
     });
 });
 

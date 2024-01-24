@@ -15,32 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import del from "del";
-import path from "path";
-import mkdirp from "mkdirp";
-import { argv } from "./argv.js";
-import { promisify } from "util";
-import globSync from "glob";
-const glob = promisify(globSync);
-import child_process from "child_process";
-import { memoizeTask } from "./memoize-task.js";
-import fs from "fs";
+import { deleteAsync as del } from 'del';
+import path from 'path';
+import { mkdirp } from 'mkdirp';
+import { argv } from './argv.js';
+import { promisify } from 'util';
+import { glob } from 'glob';
+import child_process from 'child_process';
+import { memoizeTask } from './memoize-task.js';
+import fs from 'fs';
 const readFile = promisify(fs.readFile);
-import asyncDoneSync from "async-done";
+import asyncDoneSync from 'async-done';
 const asyncDone = promisify(asyncDoneSync);
 const exec = promisify(child_process.exec);
-import xml2js from "xml2js";
+import xml2js from 'xml2js';
 const parseXML = promisify(xml2js.parseString);
-import { targetAndModuleCombinations, npmPkgName } from "./util.js";
+import { targetAndModuleCombinations, npmPkgName } from './util.js';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
 
-const jestArgv = [`--reporters=jest-silent-reporter`];
+const jestArgv = [];
 const testFiles = [
     `test/unit/`,
     // `test/unit/bit-tests.ts`,
     // `test/unit/int-tests.ts`,
+    // `test/unit/bn-tests.ts`,
     // `test/unit/math-tests.ts`,
     // `test/unit/table-tests.ts`,
     // `test/unit/generated-data-tests.ts`,
@@ -52,6 +52,8 @@ const testFiles = [
 
 if (argv.verbose) {
     jestArgv.push(`--verbose`);
+} else {
+    jestArgv.push(`--reporters=jest-silent-reporter`);
 }
 
 if (targetAndModuleCombinations.length > 1) {
@@ -119,9 +121,8 @@ async function createTestJSON() {
     await exec(`python3 -B -c '\
 import sys\n\
 sys.path.append("${ARROW_ARCHERY_DIR}")\n\
-sys.argv.append("--write_generated_json=${jsonFilesDir}")\n\
-from archery.cli import integration\n\
-integration()'`);
+from archery.integration.runner import write_js_test_json\n\
+write_js_test_json("${jsonFilesDir}")'`);
 }
 
 export async function createTestData() {

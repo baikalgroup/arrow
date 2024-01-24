@@ -51,7 +51,7 @@ except ImportError:
             """
             from setuptools_scm.git import parse
             kwargs['describe_command'] = \
-                "git describe --dirty --tags --long --match 'apache-arrow-[0-9].*'"
+                "git describe --dirty --tags --long --match 'apache-arrow-[0-9]*.*'"
             return parse(root, **kwargs)
         __version__ = setuptools_scm.get_version('../',
                                                  parse=parse_git)
@@ -66,10 +66,10 @@ import pyarrow.lib as _lib
 if _gc_enabled:
     _gc.enable()
 
-from pyarrow.lib import (BuildInfo, RuntimeInfo, MonthDayNano,
-                         VersionInfo, cpp_build_info, cpp_version,
-                         cpp_version_info, runtime_info, cpu_count,
-                         set_cpu_count, enable_signal_handlers,
+from pyarrow.lib import (BuildInfo, RuntimeInfo, set_timezone_db_path,
+                         MonthDayNano, VersionInfo, cpp_build_info,
+                         cpp_version, cpp_version_info, runtime_info,
+                         cpu_count, set_cpu_count, enable_signal_handlers,
                          io_thread_count, set_io_thread_count)
 
 
@@ -139,7 +139,7 @@ def show_info():
 
     print("\nOptional modules:")
     modules = ["csv", "cuda", "dataset", "feather", "flight", "fs", "gandiva", "json",
-               "orc", "parquet", "plasma"]
+               "orc", "parquet"]
     for module in modules:
         status = "Enabled" if _module_is_available(module) else "-"
         print(f"  {module: <20}: {status: <8}")
@@ -169,6 +169,8 @@ from pyarrow.lib import (null, bool_,
                          list_, large_list, map_, struct,
                          union, sparse_union, dense_union,
                          dictionary,
+                         run_end_encoded,
+                         fixed_shape_tensor,
                          field,
                          type_for_alias,
                          DataType, DictionaryType, StructType,
@@ -177,6 +179,7 @@ from pyarrow.lib import (null, bool_,
                          TimestampType, Time32Type, Time64Type, DurationType,
                          FixedSizeBinaryType, Decimal128Type, Decimal256Type,
                          BaseExtensionType, ExtensionType,
+                         RunEndEncodedType, FixedShapeTensorType,
                          PyExtensionType, UnknownExtensionType,
                          register_extension_type, unregister_extension_type,
                          DictionaryMemo,
@@ -197,6 +200,7 @@ from pyarrow.lib import (null, bool_,
                          Int16Array, UInt16Array,
                          Int32Array, UInt32Array,
                          Int64Array, UInt64Array,
+                         HalfFloatArray, FloatArray, DoubleArray,
                          ListArray, LargeListArray, MapArray,
                          FixedSizeListArray, UnionArray,
                          BinaryArray, StringArray,
@@ -207,6 +211,7 @@ from pyarrow.lib import (null, bool_,
                          Time32Array, Time64Array, DurationArray,
                          MonthDayNanoIntervalArray,
                          Decimal128Array, Decimal256Array, StructArray, ExtensionArray,
+                         RunEndEncodedArray, FixedShapeTensorArray,
                          scalar, NA, _NULL as NULL, Scalar,
                          NullScalar, BooleanScalar,
                          Int8Scalar, Int16Scalar, Int32Scalar, Int64Scalar,
@@ -222,7 +227,7 @@ from pyarrow.lib import (null, bool_,
                          StringScalar, LargeStringScalar,
                          FixedSizeBinaryScalar, DictionaryScalar,
                          MapScalar, StructScalar, UnionScalar,
-                         ExtensionScalar)
+                         RunEndEncodedScalar, ExtensionScalar)
 
 # Buffers, allocation
 from pyarrow.lib import (Buffer, ResizableBuffer, foreign_buffer, py_buffer,
@@ -238,7 +243,7 @@ from pyarrow.lib import (MemoryPool, LoggingMemoryPool, ProxyMemoryPool,
 
 # I/O
 from pyarrow.lib import (NativeFile, PythonFile,
-                         BufferedInputStream, BufferedOutputStream,
+                         BufferedInputStream, BufferedOutputStream, CacheOptions,
                          CompressedInputStream, CompressedOutputStream,
                          TransformInputStream, transcoding_input_stream,
                          FixedSizeBufferWriter,
@@ -250,7 +255,8 @@ from pyarrow.lib import (NativeFile, PythonFile,
 from pyarrow._hdfsio import HdfsFile, have_libhdfs
 
 from pyarrow.lib import (ChunkedArray, RecordBatch, Table, table,
-                         concat_arrays, concat_tables, TableGroupBy)
+                         concat_arrays, concat_tables, TableGroupBy,
+                         RecordBatchReader)
 
 # Exceptions
 from pyarrow.lib import (ArrowCancelled,
@@ -265,21 +271,10 @@ from pyarrow.lib import (ArrowCancelled,
                          ArrowTypeError,
                          ArrowSerializationError)
 
-# Serialization
-from pyarrow.lib import (deserialize_from, deserialize,
-                         deserialize_components,
-                         serialize, serialize_to, read_serialized,
-                         SerializationCallbackError,
-                         DeserializationCallbackError)
-
 import pyarrow.hdfs as hdfs
 
 from pyarrow.ipc import serialize_pandas, deserialize_pandas
 import pyarrow.ipc as ipc
-
-from pyarrow.serialization import (default_serialization_context,
-                                   register_default_serialization_handlers,
-                                   register_torch_serialization_handlers)
 
 import pyarrow.types as types
 
@@ -290,9 +285,6 @@ import pyarrow.types as types
 from pyarrow.filesystem import FileSystem as _FileSystem
 from pyarrow.filesystem import LocalFileSystem as _LocalFileSystem
 from pyarrow.hdfs import HadoopFileSystem as _HadoopFileSystem
-
-from pyarrow.lib import SerializationContext as _SerializationContext
-from pyarrow.lib import SerializedPyObject as _SerializedPyObject
 
 
 _localfs = _LocalFileSystem._get_instance()
@@ -314,11 +306,6 @@ _deprecated = {
     "HadoopFileSystem": (_HadoopFileSystem, "HadoopFileSystem"),
 }
 
-_serialization_deprecatd = {
-    "SerializationContext": _SerializationContext,
-    "SerializedPyObject": _SerializedPyObject,
-}
-
 
 def __getattr__(name):
     if name in _deprecated:
@@ -326,109 +313,16 @@ def __getattr__(name):
         _warnings.warn(_msg.format(name, new_name),
                        FutureWarning, stacklevel=2)
         return obj
-    elif name in _serialization_deprecatd:
-        _warnings.warn(_serialization_msg.format(name),
-                       FutureWarning, stacklevel=2)
-        return _serialization_deprecatd[name]
 
     raise AttributeError(
         "module 'pyarrow' has no attribute '{0}'".format(name)
     )
 
 
-# Entry point for starting the plasma store
-
-
-def _plasma_store_entry_point():
-    """Entry point for starting the plasma store.
-
-    This can be used by invoking e.g.
-    ``plasma_store -s /tmp/plasma -m 1000000000``
-    from the command line and will start the plasma_store executable with the
-    given arguments.
-    """
-    import pyarrow
-    plasma_store_executable = _os.path.join(pyarrow.__path__[0],
-                                            "plasma-store-server")
-    _os.execv(plasma_store_executable, _sys.argv)
-
-
 # ----------------------------------------------------------------------
 # Deprecations
 
 from pyarrow.util import _deprecate_api, _deprecate_class
-
-read_message = _deprecate_api("read_message", "ipc.read_message",
-                              ipc.read_message, "0.17.0")
-
-read_record_batch = _deprecate_api("read_record_batch",
-                                   "ipc.read_record_batch",
-                                   ipc.read_record_batch, "0.17.0")
-
-read_schema = _deprecate_api("read_schema", "ipc.read_schema",
-                             ipc.read_schema, "0.17.0")
-
-read_tensor = _deprecate_api("read_tensor", "ipc.read_tensor",
-                             ipc.read_tensor, "0.17.0")
-
-write_tensor = _deprecate_api("write_tensor", "ipc.write_tensor",
-                              ipc.write_tensor, "0.17.0")
-
-get_record_batch_size = _deprecate_api("get_record_batch_size",
-                                       "ipc.get_record_batch_size",
-                                       ipc.get_record_batch_size, "0.17.0")
-
-get_tensor_size = _deprecate_api("get_tensor_size",
-                                 "ipc.get_tensor_size",
-                                 ipc.get_tensor_size, "0.17.0")
-
-open_stream = _deprecate_api("open_stream", "ipc.open_stream",
-                             ipc.open_stream, "0.17.0")
-
-open_file = _deprecate_api("open_file", "ipc.open_file", ipc.open_file,
-                           "0.17.0")
-
-
-def _deprecate_scalar(ty, symbol):
-    return _deprecate_class("{}Value".format(ty), symbol, "1.0.0")
-
-
-ArrayValue = _deprecate_class("ArrayValue", Scalar, "1.0.0")
-NullType = _deprecate_class("NullType", NullScalar, "1.0.0")
-
-BooleanValue = _deprecate_scalar("Boolean", BooleanScalar)
-Int8Value = _deprecate_scalar("Int8", Int8Scalar)
-Int16Value = _deprecate_scalar("Int16", Int16Scalar)
-Int32Value = _deprecate_scalar("Int32", Int32Scalar)
-Int64Value = _deprecate_scalar("Int64", Int64Scalar)
-UInt8Value = _deprecate_scalar("UInt8", UInt8Scalar)
-UInt16Value = _deprecate_scalar("UInt16", UInt16Scalar)
-UInt32Value = _deprecate_scalar("UInt32", UInt32Scalar)
-UInt64Value = _deprecate_scalar("UInt64", UInt64Scalar)
-HalfFloatValue = _deprecate_scalar("HalfFloat", HalfFloatScalar)
-FloatValue = _deprecate_scalar("Float", FloatScalar)
-DoubleValue = _deprecate_scalar("Double", DoubleScalar)
-ListValue = _deprecate_scalar("List", ListScalar)
-LargeListValue = _deprecate_scalar("LargeList", LargeListScalar)
-MapValue = _deprecate_scalar("Map", MapScalar)
-FixedSizeListValue = _deprecate_scalar("FixedSizeList", FixedSizeListScalar)
-BinaryValue = _deprecate_scalar("Binary", BinaryScalar)
-StringValue = _deprecate_scalar("String", StringScalar)
-LargeBinaryValue = _deprecate_scalar("LargeBinary", LargeBinaryScalar)
-LargeStringValue = _deprecate_scalar("LargeString", LargeStringScalar)
-FixedSizeBinaryValue = _deprecate_scalar("FixedSizeBinary",
-                                         FixedSizeBinaryScalar)
-Decimal128Value = _deprecate_scalar("Decimal128", Decimal128Scalar)
-Decimal256Value = _deprecate_scalar("Decimal256", Decimal256Scalar)
-UnionValue = _deprecate_scalar("Union", UnionScalar)
-StructValue = _deprecate_scalar("Struct", StructScalar)
-DictionaryValue = _deprecate_scalar("Dictionary", DictionaryScalar)
-Date32Value = _deprecate_scalar("Date32", Date32Scalar)
-Date64Value = _deprecate_scalar("Date64", Date64Scalar)
-Time32Value = _deprecate_scalar("Time32", Time32Scalar)
-Time64Value = _deprecate_scalar("Time64", Time64Scalar)
-TimestampValue = _deprecate_scalar("Timestamp", TimestampScalar)
-DurationValue = _deprecate_scalar("Duration", DurationScalar)
 
 
 # TODO: Deprecate these somehow in the pyarrow namespace
@@ -478,7 +372,7 @@ def get_libraries():
     Return list of library names to include in the `libraries` argument for C
     or Cython extensions using pyarrow
     """
-    return ['arrow', 'arrow_python']
+    return ['arrow_python', 'arrow']
 
 
 def create_library_symlinks():

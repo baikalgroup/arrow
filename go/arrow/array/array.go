@@ -19,26 +19,19 @@ package array
 import (
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v8/arrow"
-	"github.com/apache/arrow/go/v8/arrow/bitutil"
-	"github.com/apache/arrow/go/v8/arrow/internal/debug"
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/bitutil"
+	"github.com/apache/arrow/go/v15/arrow/internal/debug"
 )
-
-// Interface aliases arrow.Array so that existing users don't get broken by
-// the migration to arrow.Array.
-//
-// Deprecated: This alias will be removed in v8
-type Interface = arrow.Array
-
-type arraymarshal interface {
-	arrow.Array
-
-	getOneForMarshal(i int) interface{}
-}
 
 const (
 	// UnknownNullCount specifies the NullN should be calculated from the null bitmap buffer.
 	UnknownNullCount = -1
+
+	// NullValueStr represents a null value in arrow.Array.ValueStr and in Builder.AppendValueFromString.
+	// It should be returned from the arrow.Array.ValueStr implementations.
+	// Using it as the value in Builder.AppendValueFromString should be equivalent to Builder.AppendNull.
+	NullValueStr = "(null)"
 )
 
 type array struct {
@@ -120,10 +113,6 @@ var (
 	makeArrayFn [64]arrayConstructorFn
 )
 
-func unsupportedArrayType(data arrow.ArrayData) arrow.Array {
-	panic("unsupported data type: " + data.DataType().ID().String())
-}
-
 func invalidDataType(data arrow.ArrayData) arrow.Array {
 	panic("invalid data type: " + data.DataType().ID().String())
 }
@@ -172,22 +161,25 @@ func init() {
 		arrow.INTERVAL_MONTHS:         func(data arrow.ArrayData) arrow.Array { return NewMonthIntervalData(data) },
 		arrow.INTERVAL_DAY_TIME:       func(data arrow.ArrayData) arrow.Array { return NewDayTimeIntervalData(data) },
 		arrow.DECIMAL128:              func(data arrow.ArrayData) arrow.Array { return NewDecimal128Data(data) },
-		arrow.DECIMAL256:              unsupportedArrayType,
+		arrow.DECIMAL256:              func(data arrow.ArrayData) arrow.Array { return NewDecimal256Data(data) },
 		arrow.LIST:                    func(data arrow.ArrayData) arrow.Array { return NewListData(data) },
 		arrow.STRUCT:                  func(data arrow.ArrayData) arrow.Array { return NewStructData(data) },
-		arrow.SPARSE_UNION:            unsupportedArrayType,
-		arrow.DENSE_UNION:             unsupportedArrayType,
-		arrow.DICTIONARY:              unsupportedArrayType,
+		arrow.SPARSE_UNION:            func(data arrow.ArrayData) arrow.Array { return NewSparseUnionData(data) },
+		arrow.DENSE_UNION:             func(data arrow.ArrayData) arrow.Array { return NewDenseUnionData(data) },
+		arrow.DICTIONARY:              func(data arrow.ArrayData) arrow.Array { return NewDictionaryData(data) },
 		arrow.MAP:                     func(data arrow.ArrayData) arrow.Array { return NewMapData(data) },
 		arrow.EXTENSION:               func(data arrow.ArrayData) arrow.Array { return NewExtensionData(data) },
 		arrow.FIXED_SIZE_LIST:         func(data arrow.ArrayData) arrow.Array { return NewFixedSizeListData(data) },
 		arrow.DURATION:                func(data arrow.ArrayData) arrow.Array { return NewDurationData(data) },
-		arrow.LARGE_STRING:            unsupportedArrayType,
-		arrow.LARGE_BINARY:            unsupportedArrayType,
-		arrow.LARGE_LIST:              unsupportedArrayType,
-		arrow.INTERVAL:                func(data arrow.ArrayData) arrow.Array { return NewIntervalData(data) },
+		arrow.LARGE_STRING:            func(data arrow.ArrayData) arrow.Array { return NewLargeStringData(data) },
+		arrow.LARGE_BINARY:            func(data arrow.ArrayData) arrow.Array { return NewLargeBinaryData(data) },
+		arrow.LARGE_LIST:              func(data arrow.ArrayData) arrow.Array { return NewLargeListData(data) },
 		arrow.INTERVAL_MONTH_DAY_NANO: func(data arrow.ArrayData) arrow.Array { return NewMonthDayNanoIntervalData(data) },
-
+		arrow.RUN_END_ENCODED:         func(data arrow.ArrayData) arrow.Array { return NewRunEndEncodedData(data) },
+		arrow.LIST_VIEW:               func(data arrow.ArrayData) arrow.Array { return NewListViewData(data) },
+		arrow.LARGE_LIST_VIEW:         func(data arrow.ArrayData) arrow.Array { return NewLargeListViewData(data) },
+		arrow.BINARY_VIEW:             func(data arrow.ArrayData) arrow.Array { return NewBinaryViewData(data) },
+		arrow.STRING_VIEW:             func(data arrow.ArrayData) arrow.Array { return NewStringViewData(data) },
 		// invalid data types to fill out array to size 2^6 - 1
 		63: invalidDataType,
 	}
