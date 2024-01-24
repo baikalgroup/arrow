@@ -133,6 +133,7 @@ ARROW_SRCS = """
     cpp/src/arrow/util/utf8.cc
     cpp/src/arrow/util/value_parsing.cc
     cpp/src/arrow/util/hashing.cc
+    cpp/src/arrow/util/ree_util.cc
     cpp/src/arrow/vendored/base64.cpp
     cpp/src/arrow/vendored/datetime/tz.cpp
     cpp/src/arrow/vendored/double-conversion/bignum.cc
