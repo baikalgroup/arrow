@@ -353,6 +353,9 @@ PARQUET_SRCS = """
     cpp/src/parquet/encryption/encryption.cc
     cpp/src/parquet/encryption/internal_file_decryptor.cc
     cpp/src/parquet/encryption/internal_file_encryptor.cc
+    cpp/src/parquet/encryption/openssl_internal.cc
+    cpp/src/parquet/encryption/encryption_internal.cc
+    cpp/src/parquet/encryption/encryption_internal_nossl.cc
     cpp/src/parquet/exception.cc
     cpp/src/parquet/file_reader.cc
     cpp/src/parquet/file_writer.cc
