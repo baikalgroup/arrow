@@ -179,9 +179,9 @@ ARROW_SRCS += """
     cpp/src/arrow/compute/function.cc
     cpp/src/arrow/compute/function_internal.cc
     cpp/src/arrow/compute/kernel.cc
-    cpp/src/arrow/compute/key_hash.cc
-    cpp/src/arrow/compute/key_map.cc
-    cpp/src/arrow/compute/light_array.cc
+    cpp/src/arrow/compute/key_hash_internal.cc
+    cpp/src/arrow/compute/key_map_internal.cc
+    cpp/src/arrow/compute/light_array_internal.cc
     cpp/src/arrow/compute/ordering.cc
     cpp/src/arrow/compute/registry.cc
     cpp/src/arrow/compute/kernels/ree_util_internal.cc
@@ -207,8 +207,8 @@ ARROW_SRCS += """
     cpp/src/arrow/compute/row/grouper.cc
     cpp/src/arrow/compute/row/row_internal.cc
     cpp/src/arrow/compute/util.cc
-    cpp/src/arrow/compute/key_hash_avx2.cc
-    cpp/src/arrow/compute/key_map_avx2.cc
+    cpp/src/arrow/compute/key_hash_internal_avx2.cc
+    cpp/src/arrow/compute/key_map_internal_avx2.cc
     cpp/src/arrow/compute/row/compare_internal_avx2.cc
     cpp/src/arrow/compute/row/encode_internal_avx2.cc
     cpp/src/arrow/compute/util_avx2.cc

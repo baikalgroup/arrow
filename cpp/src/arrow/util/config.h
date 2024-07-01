@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#define ARROW_VERSION_MAJOR 15
-#define ARROW_VERSION_MINOR 0 
+#define ARROW_VERSION_MAJOR 16 
+#define ARROW_VERSION_MINOR 1 
 #define ARROW_VERSION_PATCH 0 
 #define ARROW_VERSION ((ARROW_VERSION_MAJOR * 1000) + ARROW_VERSION_MINOR) * 1000 + ARROW_VERSION_PATCH
 
-#define ARROW_VERSION_STRING "15.0.0"
+#define ARROW_VERSION_STRING "16.1.0"
 
-#define ARROW_SO_VERSION "1500"
-#define ARROW_FULL_SO_VERSION "1500.0.0"
+#define ARROW_SO_VERSION "1601"
+#define ARROW_FULL_SO_VERSION "1601.0.0"
 
 #define ARROW_CXX_COMPILER_ID "GNU"
 #define ARROW_CXX_COMPILER_VERSION "15.0.0"
@@ -32,7 +32,7 @@
 #define ARROW_BUILD_TYPE "RELEASE"
 
 #define ARROW_GIT_ID "76eabd08a966391aadbe1fcec9f838166f81a05a"
-#define ARROW_GIT_DESCRIPTION "apache-arrow-15.0.0"
+#define ARROW_GIT_DESCRIPTION "apache-arrow-16.1.0"
 
 #define ARROW_PACKAGE_KIND ""
 
