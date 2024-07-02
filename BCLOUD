@@ -24,13 +24,14 @@ CONFIGS("baidu/third-party/rapidjson@rapidjson_V1.1.0.5_GCC820_4U3_K2_GEN_PD_BL@
 CONFIGS('baidu/third-party/zstd@zstd_1-5-2-3_PD_BL@git_tag')
 CONFIGS('baidu/third-party/re2@master@git_tag')
 CONFIGS('baidu/third-party/xsimd@xsimd_10-0-0-0_GEN_PD_BL@git_tag')
+CONFIGS('baidu/third-party/gtest@gtest_V20220602_GCC12_GEN_PD_BL@git_tag')
 
 INCPATHS('cpp/src/ cpp/thirdparty/flatbuffers/include/')
 INCPATHS("cpp/thirdparty/xsimd-10.0.0/include")
 INCPATHS("cpp/thirdparty/hadoop/include")
 
 
-LDFLAGS('-lpthread -lrt -lz')
+LDFLAGS('-lpthread -lrt -lz -ldl')
 ARROW_SRCS = """
     cpp/src/arrow/array/array_base.cc
     cpp/src/arrow/array/array_binary.cc
@@ -110,6 +111,7 @@ ARROW_SRCS = """
     cpp/src/arrow/util/debug.cc
     cpp/src/arrow/util/decimal.cc
     cpp/src/arrow/util/delimiting.cc
+    cpp/src/arrow/util/float16.cc
     cpp/src/arrow/util/formatting.cc
     cpp/src/arrow/util/future.cc
     cpp/src/arrow/util/int_util.cc
