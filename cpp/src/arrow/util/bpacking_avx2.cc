@@ -22,10 +22,12 @@
 namespace arrow {
 namespace internal {
 
+#ifdef ARROW_HAVE_RUNTIME_AVX2
 int unpack32_avx2(const uint32_t* in, uint32_t* out, int batch_size, int num_bits) {
   return unpack32_specialized<UnpackBits256<DispatchLevel::AVX2>>(in, out, batch_size,
                                                                   num_bits);
 }
+#endif
 
 }  // namespace internal
 }  // namespace arrow

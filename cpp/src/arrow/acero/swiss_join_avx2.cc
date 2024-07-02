@@ -23,6 +23,7 @@
 namespace arrow {
 namespace acero {
 
+#ifdef ARROW_HAVE_RUNTIME_AVX2
 template <class PROCESS_8_VALUES_FN>
 int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int num_rows,
                                  const uint32_t* row_ids,
@@ -188,6 +189,7 @@ int RowArrayAccessor::VisitNulls_avx2(const RowTableImpl& rows, int column_id,
 
   return num_rows - (num_rows % unroll);
 }
+#endif // ARROW_HAVE_RUNTIME_AVX2
 
 }  // namespace acero
 }  // namespace arrow
