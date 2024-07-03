@@ -29,6 +29,7 @@ CONFIGS('baidu/third-party/gtest@gtest_V20220602_GCC12_GEN_PD_BL@git_tag')
 INCPATHS('cpp/src/ cpp/thirdparty/flatbuffers/include/')
 INCPATHS("cpp/thirdparty/xsimd-10.0.0/include")
 INCPATHS("cpp/thirdparty/hadoop/include")
+CONFIGS("baidu/third-party/openssl@openssl_V3.0.0_GCC12_GEN_PD_BL@git_tag")   
 
 
 LDFLAGS('-lpthread -lrt -lz -ldl')
@@ -440,8 +441,8 @@ HEADERS("cpp/src/parquet/encryption/*", "$INC/parquet/encryption/")
 
 # .a
 StaticLibrary("arrow",  Sources(ARROW_SRCS, ARROW_ACERO_SRCS, PARQUET_SRCS, ARROW_DATASET_SRCS))
+UTApplication('read_parquet_test', Sources('cpp/src/tests/read_parquet_test.cc',  CxxFlags('-g -ggdb -O0 -fno-access-control -Wno-sign-compare -Wno-unused-variable -std=c++17')), 
+            Libraries('$OUT/lib/libarrow.a'))
+
 # UTApplication('test_arrow_vector', Sources('cpp/src/tests/test_arrow_compute.cpp',  CxxFlags('-O0 -fno-access-control -Wno-sign-compare -Wno-unused-variable -std=c++17')), 
 #             Libraries('$OUT/lib/libarrow.a'))
-# UTApplication('test_join', Sources('cpp/src/tests/extra_tests.cpp',  CxxFlags('-O0 -fno-access-control -Wno-sign-compare -Wno-unused-variable -std=c++17')), 
-#             Libraries('$OUT/lib/libarrow.a'))
-

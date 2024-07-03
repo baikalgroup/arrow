@@ -151,9 +151,10 @@ class FileReaderImpl : public FileReader {
                                 reader_properties_, &manifest_);
   }
 
-  FileColumnIteratorFactory SomeRowGroupsFactory(std::vector<int> row_groups) {
-    return [row_groups](int i, ParquetFileReader* reader) {
-      return new FileColumnIterator(i, reader, row_groups);
+  FileColumnIteratorFactory SomeRowGroupsFactory(std::vector<int> row_groups, 
+                                                std::shared_ptr<std::vector<RowRange>> row_ranges = nullptr) {
+    return [row_groups, row_ranges](int i, ParquetFileReader* reader) {
+      return new FileColumnIterator(i, reader, row_groups, row_ranges);
     };
   }
 
@@ -202,6 +203,7 @@ class FileReaderImpl : public FileReader {
   Status GetFieldReader(int i,
                         const std::shared_ptr<std::unordered_set<int>>& included_leaves,
                         const std::vector<int>& row_groups,
+                        std::shared_ptr<std::vector<RowRange>> row_ranges_ptr,
                         std::unique_ptr<ColumnReaderImpl>* out) {
     // Should be covered by GetRecordBatchReader checks but
     // manifest_.schema_fields is a separate variable so be extra careful.
@@ -215,7 +217,7 @@ class FileReaderImpl : public FileReader {
     auto ctx = std::make_shared<ReaderContext>();
     ctx->reader = reader_.get();
     ctx->pool = pool_;
-    ctx->iterator_factory = SomeRowGroupsFactory(row_groups);
+    ctx->iterator_factory = SomeRowGroupsFactory(row_groups, row_ranges_ptr);
     ctx->filter_leaves = true;
     ctx->included_leaves = included_leaves;
     return GetReader(manifest_.schema_fields[i], ctx, out);
@@ -223,6 +225,7 @@ class FileReaderImpl : public FileReader {
 
   Status GetFieldReaders(const std::vector<int>& column_indices,
                          const std::vector<int>& row_groups,
+                         std::shared_ptr<std::vector<RowRange>> row_ranges,
                          std::vector<std::shared_ptr<ColumnReaderImpl>>* out,
                          std::shared_ptr<::arrow::Schema>* out_schema) {
     // We only need to read schema fields which have columns indicated
@@ -237,7 +240,7 @@ class FileReaderImpl : public FileReader {
     for (size_t i = 0; i < out->size(); ++i) {
       std::unique_ptr<ColumnReaderImpl> reader;
       RETURN_NOT_OK(
-          GetFieldReader(field_indices[i], included_leaves, row_groups, &reader));
+          GetFieldReader(field_indices[i], included_leaves, row_groups, row_ranges, &reader));
 
       out_fields[i] = reader->field();
       out->at(i) = std::move(reader);
@@ -329,6 +332,10 @@ class FileReaderImpl : public FileReader {
                               const std::vector<int>& column_indices,
                               std::unique_ptr<RecordBatchReader>* out) override;
 
+  Status GetRecordBatchReader(const std::vector<int>& row_groups,
+                                            const std::vector<int>& column_indices,
+                                            const std::vector<RowRange>& row_ranges,
+                                            std::unique_ptr<RecordBatchReader>* out);
   Status GetRecordBatchReader(const std::vector<int>& row_group_indices,
                               std::unique_ptr<RecordBatchReader>* out) override {
     return GetRecordBatchReader(row_group_indices,
@@ -364,6 +371,11 @@ class FileReaderImpl : public FileReader {
   const ArrowReaderProperties& properties() const override { return reader_properties_; }
 
   const SchemaManifest& manifest() const override { return manifest_; }
+
+  // 对row ranges 做检查，会合并重叠区间并排序
+  Status CheckRowRanges(const std::vector<RowRange>& row_ranges, 
+                        const std::vector<int>& row_groups, 
+                        std::vector<RowRange>* row_ranges_out);
 
   Status ScanContents(std::vector<int> columns, const int32_t column_batch_size,
                       int64_t* num_rows) override {
@@ -971,22 +983,139 @@ Status GetReader(const SchemaField& field, const std::shared_ptr<ReaderContext>&
 
 }  // namespace
 
-Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_groups,
+Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_group_indices,
                                             const std::vector<int>& column_indices,
                                             std::unique_ptr<RecordBatchReader>* out) {
-  RETURN_NOT_OK(BoundsCheck(row_groups, column_indices));
+  return GetRecordBatchReader(row_group_indices, column_indices, {}, out);
+}
+
+/**
+ * @brief 排序并合并读取区间
+ *        例如输入为{{12,16}, {15, 18}, {10, 11}}，会被合并为一个区间{{10, 18}}
+*/
+RowRange SortAndMerge(const RowRange& row_range) {
+  RowRange row_range_cpy = row_range;
+
+  // 清除错误的区间 (start > end 的区间)
+  auto new_end = std::remove_if(row_range_cpy.begin(), row_range_cpy.end(), [](const auto& range) {
+    return range.first > range.second;
+  });
+  row_range_cpy.erase(new_end, row_range_cpy.end());
+
+  std::sort(row_range_cpy.begin(), row_range_cpy.end());
+
+  RowRange merged;
+  // merge 重叠区间 {{1, 4}, {3, 5}} --> {1, 5}
+  for(const auto& it: row_range_cpy) {
+    auto left = it.first, right = it.second;
+    if (!merged.size() || merged.back().second + 1 < left) {
+      merged.push_back({left, right});
+    } else {
+      merged.back().second = std::max(right, merged.back().second);
+    }
+  }
+  return merged;
+}
+
+// using RowRange = std::vector<int64_t, int64_t>
+
+// 检查row_range 是否越界，并合并重叠的区间，输出到row_ranges_out
+Status FileReaderImpl::CheckRowRanges(const std::vector<RowRange>& row_ranges, 
+                                      const std::vector<int>& row_groups, 
+                                      std::vector<RowRange>* row_ranges_out) {
+  if (row_ranges.size() != row_groups.size()) {
+    return Status::Invalid("Number of row ranges must match number of row groups");
+  }
+
+  if (row_ranges.size() == 0) {
+    return Status::OK();
+  }
+
+  std::vector<int> row_group_max_indexes;
+  std::transform(row_groups.begin(), 
+                row_groups.end(), 
+                std::back_inserter(row_group_max_indexes),
+                [this](auto idx){
+                  return parquet_reader()->metadata()->RowGroup(idx)->num_rows() - 1;
+                });
+
+  std::vector<RowRange> row_ranges_cpy = row_ranges;
+  for (int i = 0; i < row_groups.size(); ++i){
+    auto& row_range = row_ranges_cpy[i];
+    for (auto& range_pair: row_range) {
+      if (range_pair.first < 0) {
+        range_pair.first = 0;
+      }
+      if (range_pair.second < 0) {
+        range_pair.second = row_group_max_indexes[i];
+      }
+      if (range_pair.second < range_pair.first) {
+        return Status::Invalid("Range with end < start: start at", 
+                                range_pair.first, " and end at:", range_pair.second);
+      }
+    }
+  }
+
+  if (row_ranges_out) {
+    row_ranges_out->clear();
+  }
+  
+  for (int i = 0; i < row_groups.size(); ++i) {
+    RowRange row_range = SortAndMerge(row_ranges_cpy[i]);
+
+    if (0 != row_range.size() && row_range.back().second > row_group_max_indexes[i]) {
+      return Status::Invalid("Row range {", row_range.back().first, ", ",row_range.back().second ,
+                              "} is out of bounds. Maximum row range: ", row_group_max_indexes[i]);
+    }
+    // if (row_range.size() == 1 && row_range[0].first == 0 
+    //     && row_range[0].second == row_group_max_indexes[i]) {
+    //   // 合并后只有一个从头到尾的区间，转换为全扫描
+    //   row_range.clear();
+    // }
+
+    if (row_ranges_out) {
+      row_ranges_out->emplace_back(std::move(row_range));
+    }
+  }
+  return Status::OK();
+}
+
+Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_group_indices,
+                                            const std::vector<int>& column_indices,
+                                            const std::vector<RowRange>& row_ranges,
+                                            std::unique_ptr<RecordBatchReader>* out) {
+  RETURN_NOT_OK(BoundsCheck(row_group_indices, column_indices));
 
   if (reader_properties_.pre_buffer()) {
     // PARQUET-1698/PARQUET-1820: pre-buffer row groups/column chunks if enabled
     BEGIN_PARQUET_CATCH_EXCEPTIONS
-    reader_->PreBuffer(row_groups, column_indices, reader_properties_.io_context(),
+    reader_->PreBuffer(row_group_indices, column_indices, reader_properties_.io_context(),
                        reader_properties_.cache_options());
     END_PARQUET_CATCH_EXCEPTIONS
   }
 
+  bool use_row_range = (0 != row_ranges.size());
+
+  int64_t num_rows = 0;
+
+  std::shared_ptr<std::vector<RowRange>> row_ranges_ptr;
+  if (use_row_range) {
+    std::vector<RowRange> checked_row_ranges;
+    RETURN_NOT_OK(CheckRowRanges(row_ranges, row_group_indices, &checked_row_ranges));
+
+    for (int i = 0; i < row_group_indices.size(); ++i) {
+      const RowRange& row_range = checked_row_ranges[i];
+      num_rows += std::accumulate(row_range.begin(), row_range.end(), 0,
+                              [](int sum, const RowRangeItem& range_pair) {
+                                  return sum + (range_pair.second - range_pair.first + 1);
+                              });
+    }
+    row_ranges_ptr = std::make_shared<std::vector<RowRange>>(checked_row_ranges);
+  }
+
   std::vector<std::shared_ptr<ColumnReaderImpl>> readers;
   std::shared_ptr<::arrow::Schema> batch_schema;
-  RETURN_NOT_OK(GetFieldReaders(column_indices, row_groups, &readers, &batch_schema));
+  RETURN_NOT_OK(GetFieldReaders(column_indices, row_group_indices, row_ranges_ptr, &readers, &batch_schema));
 
   if (readers.empty()) {
     // Just generate all batches right now; they're cheap since they have no columns.
@@ -996,7 +1125,7 @@ Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_groups,
 
     ::arrow::RecordBatchVector batches;
 
-    for (int row_group : row_groups) {
+    for (int row_group : row_group_indices) {
       int64_t num_rows = parquet_reader()->metadata()->RowGroup(row_group)->num_rows();
 
       batches.insert(batches.end(), static_cast<size_t>(num_rows / batch_size),
@@ -1013,9 +1142,10 @@ Status FileReaderImpl::GetRecordBatchReader(const std::vector<int>& row_groups,
     return Status::OK();
   }
 
-  int64_t num_rows = 0;
-  for (int row_group : row_groups) {
-    num_rows += parquet_reader()->metadata()->RowGroup(row_group)->num_rows();
+  if (!use_row_range) {
+    for (int row_group : row_group_indices) {
+      num_rows += parquet_reader()->metadata()->RowGroup(row_group)->num_rows();
+    }
   }
 
   using ::arrow::RecordBatchIterator;
@@ -1241,7 +1371,7 @@ Future<std::shared_ptr<Table>> FileReaderImpl::DecodeRowGroups(
   // in a sync context too so use `this` over `self`
   std::vector<std::shared_ptr<ColumnReaderImpl>> readers;
   std::shared_ptr<::arrow::Schema> result_schema;
-  RETURN_NOT_OK(GetFieldReaders(column_indices, row_groups, &readers, &result_schema));
+  RETURN_NOT_OK(GetFieldReaders(column_indices, row_groups, nullptr, &readers, &result_schema));
   // OptionalParallelForAsync requires an executor
   if (!cpu_executor) cpu_executor = ::arrow::internal::GetCpuThreadPool();
 
@@ -1300,6 +1430,16 @@ Status FileReader::GetRecordBatchReader(const std::vector<int>& row_group_indice
                                         std::shared_ptr<RecordBatchReader>* out) {
   std::unique_ptr<RecordBatchReader> tmp;
   RETURN_NOT_OK(GetRecordBatchReader(row_group_indices, column_indices, &tmp));
+  out->reset(tmp.release());
+  return Status::OK();
+}
+
+Status FileReader::GetRecordBatchReader(const std::vector<int>& row_group_indices,
+                                        const std::vector<int>& column_indices,
+                                        const std::vector<RowRange>& row_ranges,
+                                        std::shared_ptr<RecordBatchReader>* out) {
+  std::unique_ptr<RecordBatchReader> tmp;
+  RETURN_NOT_OK(GetRecordBatchReader(row_group_indices, column_indices, row_ranges, &tmp));
   out->reset(tmp.release());
   return Status::OK();
 }

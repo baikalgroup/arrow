@@ -154,14 +154,15 @@ std::shared_ptr<internal::RecordReader> RowGroupReader::RecordReaderWithExposeEn
           IsColumnChunkFullyDictionaryEncoded(*metadata()->ColumnChunk(i)));
 }
 
-std::unique_ptr<PageReader> RowGroupReader::GetColumnPageReader(int i) {
+std::unique_ptr<PageReader> RowGroupReader::GetColumnPageReader(int i, 
+                              std::shared_ptr<PageReaderContext> page_reader_ctx) {
   if (i >= metadata()->num_columns()) {
     std::stringstream ss;
     ss << "Trying to read column index " << i << " but row group metadata has only "
        << metadata()->num_columns() << " columns";
     throw ParquetException(ss.str());
   }
-  return contents_->GetColumnPageReader(i);
+  return contents_->GetColumnPageReader(i, page_reader_ctx);
 }
 
 // Returns the rowgroup metadata
@@ -215,14 +216,17 @@ class SerializedRowGroup : public RowGroupReader::Contents {
                      std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source,
                      int64_t source_size, FileMetaData* file_metadata,
                      int row_group_number, ReaderProperties props,
-                     std::shared_ptr<Buffer> prebuffered_column_chunks_bitmap)
+                     std::shared_ptr<Buffer> prebuffered_column_chunks_bitmap,
+                     const std::vector<std::shared_ptr<OffsetIndex>>& offset_indexes = {})
       : source_(std::move(source)),
         cached_source_(std::move(cached_source)),
         source_size_(source_size),
         file_metadata_(file_metadata),
         properties_(std::move(props)),
         row_group_ordinal_(row_group_number),
-        prebuffered_column_chunks_bitmap_(std::move(prebuffered_column_chunks_bitmap)) {
+        prebuffered_column_chunks_bitmap_(std::move(prebuffered_column_chunks_bitmap)),
+        offset_indexes_(offset_indexes) {
+
     row_group_metadata_ = file_metadata->RowGroup(row_group_number);
   }
 
@@ -230,13 +234,16 @@ class SerializedRowGroup : public RowGroupReader::Contents {
 
   const ReaderProperties* properties() const override { return &properties_; }
 
-  std::unique_ptr<PageReader> GetColumnPageReader(int i) override {
+  std::unique_ptr<PageReader> GetColumnPageReader(
+            int i, 
+            std::shared_ptr<PageReaderContext> page_reader_ctx) override {
     // Read column chunk from the file
     auto col = row_group_metadata_->ColumnChunk(i);
 
     ::arrow::io::ReadRange col_range =
         ComputeColumnChunkRange(file_metadata_, source_size_, row_group_ordinal_, i);
     std::shared_ptr<ArrowInputStream> stream;
+    CheckAndFillPageReaderCtx(page_reader_ctx, i);
     if (cached_source_ && prebuffered_column_chunks_bitmap_ != nullptr &&
         ::arrow::bit_util::GetBit(prebuffered_column_chunks_bitmap_->data(), i)) {
       // PARQUET-1698: if read coalescing is enabled, read from pre-buffered
@@ -257,7 +264,7 @@ class SerializedRowGroup : public RowGroupReader::Contents {
     // Column is encrypted only if crypto_metadata exists.
     if (!crypto_metadata) {
       return PageReader::Open(stream, col->num_values(), col->compression(), properties_,
-                              always_compressed);
+                              always_compressed, /*ctx*/NULLPTR, page_reader_ctx);
     }
 
     // The column is encrypted
@@ -276,10 +283,22 @@ class SerializedRowGroup : public RowGroupReader::Contents {
     CryptoContext ctx(col->has_dictionary_page(), row_group_ordinal_,
                       static_cast<int16_t>(i), meta_decryptor, data_decryptor);
     return PageReader::Open(stream, col->num_values(), col->compression(), properties_,
-                            always_compressed, &ctx);
+                            always_compressed, &ctx, page_reader_ctx);
   }
 
  private:
+  bool CheckAndFillPageReaderCtx(std::shared_ptr<PageReaderContext>& ctx, int idx) const {
+    if (ctx == nullptr || !ctx->use_row_range) {
+      return false;
+    }
+    ::arrow::io::ReadRange col_range =
+        ComputeColumnChunkRange(file_metadata_, source_size_, row_group_ordinal_, idx);
+    ctx->offset_index = offset_indexes_[idx];
+    ctx->start_pos = col_range.offset;
+    ctx->max_row_id = metadata()->num_rows() - 1;
+    return true;
+  }
+
   std::shared_ptr<ArrowInputFile> source_;
   // Will be nullptr if PreBuffer() is not called.
   std::shared_ptr<::arrow::io::internal::ReadRangeCache> cached_source_;
@@ -289,6 +308,8 @@ class SerializedRowGroup : public RowGroupReader::Contents {
   ReaderProperties properties_;
   int row_group_ordinal_;
   const std::shared_ptr<const Buffer> prebuffered_column_chunks_bitmap_;
+
+  std::vector<std::shared_ptr<OffsetIndex>> offset_indexes_;
 };
 
 // ----------------------------------------------------------------------
@@ -326,10 +347,21 @@ class SerializedFile : public ParquetFileReader::Contents {
     if (prebuffered_column_chunks_iter != prebuffered_column_chunks_.end()) {
       prebuffered_column_chunks_bitmap = prebuffered_column_chunks_iter->second;
     }
-
-    std::unique_ptr<SerializedRowGroup> contents = std::make_unique<SerializedRowGroup>(
+    int cols = metadata()->num_columns();
+    std::vector<std::shared_ptr<OffsetIndex>> row_group_offset_indexes;
+    std::shared_ptr<PageIndexReader> page_index_reader = GetPageIndexReader();
+    std::shared_ptr<RowGroupPageIndexReader> row_group_index_reader = page_index_reader->RowGroup(i);
+    for(int col = 0; col < cols; ++col) {
+      if (row_group_index_reader) {
+        row_group_offset_indexes.emplace_back(row_group_index_reader->GetOffsetIndex(col));
+      } else {
+        row_group_offset_indexes.emplace_back(nullptr);
+      }
+    }
+    auto contents = std::make_unique<SerializedRowGroup>(
         source_, cached_source_, source_size_, file_metadata_.get(), i, properties_,
-        std::move(prebuffered_column_chunks_bitmap));
+        std::move(prebuffered_column_chunks_bitmap),
+        row_group_offset_indexes);
     return std::make_shared<RowGroupReader>(std::move(contents));
   }
 
