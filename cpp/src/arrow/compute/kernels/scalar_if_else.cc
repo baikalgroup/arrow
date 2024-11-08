@@ -737,7 +737,7 @@ struct IfElseFunctor<Type, enable_if_base_binary<Type>> {
     const auto* right_offsets = right.GetValues<OffsetType>(1);
     const uint8_t* right_data = right.buffers[2].data;
 
-    if (!left.is_valid) {  // left is null scalar, only need to copy right data to output
+    if (!left.is_valid && right_offsets[0] == 0) {  // left is null scalar, only need to copy right data to output
       auto* out_data = out->array_data().get();
       auto offset_length = (cond.length + 1) * sizeof(OffsetType);
       ARROW_ASSIGN_OR_RAISE(out_data->buffers[1], ctx->Allocate(offset_length));
@@ -777,7 +777,7 @@ struct IfElseFunctor<Type, enable_if_base_binary<Type>> {
     const auto* left_offsets = left.GetValues<OffsetType>(1);
     const uint8_t* left_data = left.buffers[2].data;
 
-    if (!right.is_valid) {  // right is null scalar, only need to copy left data to output
+    if (!right.is_valid && left_offsets[0] == 0) {  // right is null scalar, only need to copy left data to output
       auto* out_data = out->array_data().get();
       auto offset_length = (cond.length + 1) * sizeof(OffsetType);
       ARROW_ASSIGN_OR_RAISE(out_data->buffers[1], ctx->Allocate(offset_length));
