@@ -82,6 +82,7 @@ class ARROW_EXPORT RowTableEncoder {
   /// buffers.
   /// The output can be used to find out required varying length buffers sizes
   /// for the call to DecodeVaryingLengthBuffers
+  /// 暂时只被grouper用到
   void DecodeFixedLengthBuffers(int64_t start_row_input, int64_t start_row_output,
                                 int64_t num_rows, const RowTableImpl& rows,
                                 std::vector<KeyColumnArray>* cols, int64_t hardware_flags,
@@ -117,7 +118,7 @@ class ARROW_EXPORT RowTableEncoder {
   // All elements are ordered according to the order of encoded fields in a row.
   std::vector<KeyColumnArray> batch_all_cols_;
   std::vector<KeyColumnArray> batch_varbinary_cols_;
-  std::vector<uint32_t> batch_varbinary_cols_base_offsets_;
+  std::vector<uint64_t> batch_varbinary_cols_base_offsets_;
 };
 
 class EncoderInteger {
@@ -152,7 +153,7 @@ class EncoderBinary {
                                 const uint16_t* selection, COPY_FN copy_fn,
                                 SET_NULL_FN set_null_fn);
 
-  template <bool is_row_fixed_length, class COPY_FN>
+  template <class COPY_FN>
   static inline void DecodeHelper(uint32_t start_row, uint32_t num_rows,
                                   uint32_t offset_within_row,
                                   const RowTableImpl* rows_const,
@@ -163,35 +164,22 @@ class EncoderBinary {
     ARROW_DCHECK(col_const && col_const->metadata().is_fixed_length);
     uint32_t col_width = col_const->metadata().fixed_length;
 
-    if (is_row_fixed_length) {
-      uint32_t row_width = rows_const->metadata().fixed_length;
-      for (uint32_t i = 0; i < num_rows; ++i) {
-        const uint8_t* src;
-        uint8_t* dst;
-        src = rows_const->data(1) + row_width * (start_row + i) + offset_within_row;
-        dst = col_mutable_maybe_null->mutable_data(1) + col_width * i;
-        copy_fn(dst, src, col_width);
-      }
-    } else {
-      const uint32_t* row_offsets = rows_const->offsets();
-      for (uint32_t i = 0; i < num_rows; ++i) {
-        const uint8_t* src;
-        uint8_t* dst;
-        src = rows_const->data(2) + row_offsets[start_row + i] + offset_within_row;
-        dst = col_mutable_maybe_null->mutable_data(1) + col_width * i;
-        copy_fn(dst, src, col_width);
-      }
+    uint32_t row_width = rows_const->metadata().row_length();
+    for (uint32_t i = 0; i < num_rows; ++i) {
+      const uint8_t* src;
+      uint8_t* dst;
+      src = rows_const->data(1) + row_width * (start_row + i) + offset_within_row;
+      dst = col_mutable_maybe_null->mutable_data(1) + col_width * i;
+      copy_fn(dst, src, col_width);
     }
   }
 
-  template <bool is_row_fixed_length>
   static void DecodeImp(uint32_t start_row, uint32_t num_rows, uint32_t offset_within_row,
                         const RowTableImpl& rows, KeyColumnArray* col);
 #if defined(ARROW_HAVE_RUNTIME_AVX2)
-  static void DecodeHelper_avx2(bool is_row_fixed_length, uint32_t start_row,
+  static void DecodeHelper_avx2(uint32_t start_row,
                                 uint32_t num_rows, uint32_t offset_within_row,
                                 const RowTableImpl& rows, KeyColumnArray* col);
-  template <bool is_row_fixed_length>
   static void DecodeImp_avx2(uint32_t start_row, uint32_t num_rows,
                              uint32_t offset_within_row, const RowTableImpl& rows,
                              KeyColumnArray* col);
@@ -209,44 +197,35 @@ class EncoderBinaryPair {
                      LightContext* ctx, KeyColumnArray* temp1, KeyColumnArray* temp2);
 
  private:
-  template <bool is_row_fixed_length, typename col1_type, typename col2_type>
+  template <typename col1_type, typename col2_type>
   static void DecodeImp(uint32_t num_rows_to_skip, uint32_t start_row, uint32_t num_rows,
                         uint32_t offset_within_row, const RowTableImpl& rows,
                         KeyColumnArray* col1, KeyColumnArray* col2);
 #if defined(ARROW_HAVE_RUNTIME_AVX2)
-  static uint32_t DecodeHelper_avx2(bool is_row_fixed_length, uint32_t col_width,
+  static uint32_t DecodeHelper_avx2(uint32_t col_width,
                                     uint32_t start_row, uint32_t num_rows,
                                     uint32_t offset_within_row, const RowTableImpl& rows,
                                     KeyColumnArray* col1, KeyColumnArray* col2);
-  template <bool is_row_fixed_length, uint32_t col_width>
+  template <uint32_t col_width>
   static uint32_t DecodeImp_avx2(uint32_t start_row, uint32_t num_rows,
                                  uint32_t offset_within_row, const RowTableImpl& rows,
                                  KeyColumnArray* col1, KeyColumnArray* col2);
 #endif
 };
 
+
 class EncoderOffsets {
  public:
-  static void GetRowOffsetsSelected(RowTableImpl* rows,
-                                    const std::vector<KeyColumnArray>& cols,
-                                    uint32_t num_selected, const uint16_t* selection);
-  static void EncodeSelected(RowTableImpl* rows, const std::vector<KeyColumnArray>& cols,
-                             uint32_t num_selected, const uint16_t* selection);
-
   static void Decode(uint32_t start_row, uint32_t num_rows, const RowTableImpl& rows,
                      std::vector<KeyColumnArray>* varbinary_cols,
-                     const std::vector<uint32_t>& varbinary_cols_base_offset,
+                     const std::vector<uint64_t>& varbinary_cols_base_offset,
                      LightContext* ctx);
-
- private:
-  template <bool has_nulls, bool is_first_varbinary>
-  static void EncodeSelectedImp(uint32_t ivarbinary, RowTableImpl* rows,
-                                const std::vector<KeyColumnArray>& cols,
-                                uint32_t num_selected, const uint16_t* selection);
 };
+
 
 class EncoderVarBinary {
  public:
+  template<bool is_large_binary>
   static void EncodeSelected(uint32_t ivarbinary, RowTableImpl* rows,
                              const KeyColumnArray& cols, uint32_t num_selected,
                              const uint16_t* selection);
@@ -255,7 +234,8 @@ class EncoderVarBinary {
                      const RowTableImpl& rows, KeyColumnArray* col, LightContext* ctx);
 
  private:
-  template <bool first_varbinary_col, class COPY_FN>
+ // offset_type 对 largeBinary来说是uint64_t， binary是uint32_t
+  template <bool large_binary_col, class COPY_FN>
   static inline void DecodeHelper(uint32_t start_row, uint32_t num_rows,
                                   uint32_t varbinary_col_id,
                                   const RowTableImpl* rows_const,
@@ -267,44 +247,29 @@ class EncoderVarBinary {
     ARROW_DCHECK(!rows_const->metadata().is_fixed_length &&
                  !col_const->metadata().is_fixed_length);
 
-    const uint32_t* row_offsets_for_batch = rows_const->offsets() + start_row;
-    const uint32_t* col_offsets = col_const->offsets();
+    const uint32_t* col_offsets32 = col_const->offsets();
+    const uint64_t* col_offsets64 = col_const->large_offsets();
 
-    uint32_t col_offset_next = col_offsets[0];
+    const uint32_t row_width = rows_const->metadata().row_length();
+    const uint8_t* row_base = rows_const->data(1) + start_row * row_width;
+
     for (uint32_t i = 0; i < num_rows; ++i) {
-      uint32_t col_offset = col_offset_next;
-      col_offset_next = col_offsets[i + 1];
-
-      uint32_t row_offset = row_offsets_for_batch[i];
-      const uint8_t* row = rows_const->data(2) + row_offset;
-
-      uint32_t offset_within_row;
-      uint32_t length;
-      if (first_varbinary_col) {
-        rows_const->metadata().first_varbinary_offset_and_length(row, &offset_within_row,
-                                                                 &length);
-      } else {
-        rows_const->metadata().nth_varbinary_offset_and_length(
-            row, varbinary_col_id, &offset_within_row, &length);
-      }
-
-      row_offset += offset_within_row;
+      const BinaryView* binary_view = rows_const->metadata().nth_varbinary_ptr(row_base + i * row_width, varbinary_col_id);
 
       const uint8_t* src;
       uint8_t* dst;
-      src = rows_const->data(2) + row_offset;
-      dst = col_mutable_maybe_null->mutable_data(2) + col_offset;
-      copy_fn(dst, src, length);
+      src = binary_view->data();
+      dst = col_mutable_maybe_null->mutable_data(2) + (large_binary_col ? col_offsets64[i]: col_offsets32[i]);
+      copy_fn(dst, src, binary_view->length());
     }
   }
-  template <bool first_varbinary_col>
   static void DecodeImp(uint32_t start_row, uint32_t num_rows, uint32_t varbinary_col_id,
                         const RowTableImpl& rows, KeyColumnArray* col);
 #if defined(ARROW_HAVE_RUNTIME_AVX2)
   static void DecodeHelper_avx2(uint32_t start_row, uint32_t num_rows,
                                 uint32_t varbinary_col_id, const RowTableImpl& rows,
                                 KeyColumnArray* col);
-  template <bool first_varbinary_col>
+  template<bool is_large_binary>
   static void DecodeImp_avx2(uint32_t start_row, uint32_t num_rows,
                              uint32_t varbinary_col_id, const RowTableImpl& rows,
                              KeyColumnArray* col);

@@ -280,6 +280,18 @@ class TailSkipForSIMD {
     }
     return num_rows_safe;
   }
+  static int64_t FixVarLargeBinaryAccess(int num_bytes_accessed_together, int64_t num_rows,
+                                    const uint64_t* offsets) {
+    // Do not process rows that could read past the end of the buffer using N
+    // byte loads/stores.
+    //
+    int64_t num_rows_safe = num_rows;
+    while (num_rows_safe > 0 &&
+           offsets[num_rows_safe] + num_bytes_accessed_together > offsets[num_rows]) {
+      --num_rows_safe;
+    }
+    return num_rows_safe;
+  }
   static int FixSelection(int64_t num_rows_safe, int num_selected,
                           const uint16_t* selection) {
     int num_selected_safe = num_selected;

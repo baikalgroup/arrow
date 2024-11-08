@@ -278,7 +278,7 @@ Status ResizableArrayData::ResizeFixedLengthBuffers(int num_rows_new) {
       ARROW_ASSIGN_OR_RAISE(
           buffers_[kFixedLengthBuffer],
           AllocateResizableBuffer(
-              (num_rows_allocated_new + 1) * sizeof(uint32_t) + kNumPaddingBytes, pool_));
+              (num_rows_allocated_new + 1) * column_metadata.fixed_length + kNumPaddingBytes, pool_));
     }
 
     ARROW_ASSIGN_OR_RAISE(
@@ -312,7 +312,7 @@ Status ResizableArrayData::ResizeFixedLengthBuffers(int num_rows_new) {
       }
     } else {
       RETURN_NOT_OK(buffers_[kFixedLengthBuffer]->Resize(
-          (num_rows_allocated_new + 1) * sizeof(uint32_t) + kNumPaddingBytes));
+          (num_rows_allocated_new + 1) * column_metadata.fixed_length + kNumPaddingBytes));
     }
   }
 
@@ -327,10 +327,12 @@ Status ResizableArrayData::ResizeVaryingLengthBuffer() {
   column_metadata = ColumnMetadataFromDataType(data_type_).ValueOrDie();
 
   if (!column_metadata.is_fixed_length) {
-    int64_t min_new_size = buffers_[kFixedLengthBuffer]->data_as<int32_t>()[num_rows_];
+    uint64_t min_new_size = column_metadata.is_large_binary() ? 
+                          buffers_[kFixedLengthBuffer]->data_as<uint64_t>()[num_rows_]
+                          : buffers_[kFixedLengthBuffer]->data_as<uint32_t>()[num_rows_];
     ARROW_DCHECK(var_len_buf_size_ > 0);
     if (var_len_buf_size_ < min_new_size) {
-      int64_t new_size = var_len_buf_size_;
+      uint64_t new_size = var_len_buf_size_;
       while (new_size < min_new_size) {
         new_size *= 2;
       }
@@ -394,8 +396,14 @@ int ExecBatchBuilder::NumRowsToSkip(const std::shared_ptr<ArrayData>& column,
     if (column_metadata.is_fixed_length) {
       num_bytes_skipped += column_metadata.fixed_length;
     } else {
-      const int32_t* offsets = column->GetValues<int32_t>(1);
-      num_bytes_skipped += offsets[row_id_removed + 1] - offsets[row_id_removed];
+      bool is_large_binary = column_metadata.is_large_binary();
+      if (is_large_binary) {
+        const uint64_t* offsets = column->GetValues<uint64_t>(1);
+        num_bytes_skipped += offsets[row_id_removed + 1] - offsets[row_id_removed];
+      } else {
+        const uint32_t* offsets = column->GetValues<uint32_t>(1);
+        num_bytes_skipped += offsets[row_id_removed + 1] - offsets[row_id_removed];
+      }
     }
     // Skip consecutive rows with the same id
     while (num_rows_left > 0 && row_id_removed == row_ids[num_rows_left - 1]) {
@@ -466,12 +474,22 @@ void ExecBatchBuilder::Visit(const std::shared_ptr<ArrayData>& column, int num_r
 
   if (!metadata.is_fixed_length) {
     const uint8_t* ptr_base = column->buffers[2]->data();
-    const int32_t* offsets = column->GetValues<int32_t>(1);
+    bool is_large_binary = metadata.is_large_binary();
+    
+    const uint64_t* offsets64 = column->GetValues<uint64_t>(1) + column->offset;
+    const uint32_t* offsets32 = column->GetValues<uint32_t>(1) + column->offset;
+
     for (int i = 0; i < num_rows; ++i) {
       uint16_t row_id = row_ids[i];
-      const uint8_t* field_ptr = ptr_base + offsets[row_id];
-      int32_t field_length = offsets[row_id + 1] - offsets[row_id];
-      process_value_fn(i, field_ptr, field_length);
+      if (is_large_binary) {
+        const uint8_t* field_ptr = ptr_base + offsets64[row_id];
+        uint32_t field_length = static_cast<uint32_t>(offsets64[row_id + 1] - offsets64[row_id]);
+        process_value_fn(i, field_ptr, field_length);
+      } else {
+        const uint8_t* field_ptr = ptr_base + offsets32[row_id];
+        uint32_t field_length = offsets32[row_id + 1] - offsets32[row_id];
+        process_value_fn(i, field_ptr, field_length);
+      }
     }
   } else {
     ARROW_DCHECK(metadata.fixed_length > 0);
@@ -575,25 +593,34 @@ Status ExecBatchBuilder::AppendSelected(const std::shared_ptr<ArrayData>& source
 
     // Step 1: calculate target offsets
     //
-    int32_t* offsets = reinterpret_cast<int32_t*>(target->mutable_data(1));
-    int32_t sum = num_rows_before == 0 ? 0 : offsets[num_rows_before];
+    bool is_large_binary = column_metadata.is_large_binary();
+    uint32_t* offsets32 = reinterpret_cast<uint32_t*>(target->mutable_data(1));
+    uint64_t* offsets64 = reinterpret_cast<uint64_t*>(target->mutable_data(1));
+    uint64_t sum = num_rows_before == 0 ? 0 : (is_large_binary ? offsets64[num_rows_before]: offsets32[num_rows_before]);
     Visit(source, num_rows_to_append, row_ids,
-          [&](int i, const uint8_t* ptr, int32_t num_bytes) {
-            offsets[num_rows_before + i] = num_bytes;
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
+            if (is_large_binary) {
+              offsets64[num_rows_before + i] = num_bytes;
+            } else {
+              offsets32[num_rows_before + i] = num_bytes;
+            }
           });
     for (int i = 0; i < num_rows_to_append; ++i) {
-      int32_t length = offsets[num_rows_before + i];
-      offsets[num_rows_before + i] = sum;
-      int32_t new_sum_maybe_overflow = 0;
-      if (ARROW_PREDICT_FALSE(
-              arrow::internal::AddWithOverflow(sum, length, &new_sum_maybe_overflow))) {
-        return Status::Invalid("Overflow detected in ExecBatchBuilder when appending ",
-                               num_rows_before + i + 1, "-th element of length ", length,
-                               " bytes to current length ", sum, " bytes");
+      if (is_large_binary) {
+        uint64_t length = offsets64[num_rows_before + i];
+        offsets64[num_rows_before + i] = sum;
+        sum += length;
+      } else {
+        uint32_t length = offsets32[num_rows_before + i];
+        offsets32[num_rows_before + i] = static_cast<uint32_t>(sum);
+        sum += length;
       }
-      sum = new_sum_maybe_overflow;
     }
-    offsets[num_rows_before + num_rows_to_append] = sum;
+    if (is_large_binary) {
+      offsets64[num_rows_before + num_rows_to_append] = sum;
+    } else {
+      offsets32[num_rows_before + num_rows_to_append] = static_cast<uint32_t>(sum);
+    }
 
     // Step 2: resize output buffers
     //
@@ -605,9 +632,11 @@ Status ExecBatchBuilder::AppendSelected(const std::shared_ptr<ArrayData>& source
         num_rows_to_append -
         NumRowsToSkip(source, num_rows_to_append, row_ids, sizeof(uint64_t));
     Visit(source, num_rows_to_process, row_ids,
-          [&](int i, const uint8_t* ptr, int32_t num_bytes) {
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
+            // 三元运算符优先级非常低
             uint64_t* dst = reinterpret_cast<uint64_t*>(target->mutable_data(2) +
-                                                        offsets[num_rows_before + i]);
+                                                        (is_large_binary ? offsets64[num_rows_before + i]: 
+                                                                          offsets32[num_rows_before + i]));
             const uint64_t* src = reinterpret_cast<const uint64_t*>(ptr);
             for (uint32_t word_id = 0;
                  word_id < bit_util::CeilDiv(num_bytes, sizeof(uint64_t)); ++word_id) {
@@ -617,8 +646,10 @@ Status ExecBatchBuilder::AppendSelected(const std::shared_ptr<ArrayData>& source
     Visit(source, num_rows_to_append - num_rows_to_process, row_ids + num_rows_to_process,
           [&](int i, const uint8_t* ptr, int32_t num_bytes) {
             uint64_t* dst = reinterpret_cast<uint64_t*>(
-                target->mutable_data(2) +
-                offsets[num_rows_before + num_rows_to_process + i]);
+                target->mutable_data(2) + 
+                (is_large_binary?
+                    offsets64[num_rows_before + num_rows_to_process + i]: 
+                    offsets32[num_rows_before + num_rows_to_process + i]));
             const uint64_t* src = reinterpret_cast<const uint64_t*>(ptr);
             memcpy(dst, src, num_bytes);
           });
@@ -669,10 +700,18 @@ Status ExecBatchBuilder::AppendNulls(const std::shared_ptr<DataType>& type,
              0, static_cast<int64_t>(column_metadata.fixed_length) * num_rows_to_append);
     }
   } else {
-    uint32_t* dst = reinterpret_cast<uint32_t*>(target.mutable_data(1));
-    uint32_t sum = num_rows_before == 0 ? 0 : dst[num_rows_before];
-    for (int64_t i = num_rows_before; i <= num_rows_after; ++i) {
-      dst[i] = sum;
+    if (column_metadata.is_large_binary()) {
+      uint64_t* dst = reinterpret_cast<uint64_t*>(target.mutable_data(1));
+      uint64_t sum = num_rows_before == 0 ? 0 : dst[num_rows_before];
+      for (int64_t i = num_rows_before; i <= num_rows_after; ++i) {
+        dst[i] = sum;
+      }
+    } else {
+      uint32_t* dst = reinterpret_cast<uint32_t*>(target.mutable_data(1));
+      uint32_t sum = num_rows_before == 0 ? 0 : dst[num_rows_before];
+      for (int64_t i = num_rows_before; i <= num_rows_after; ++i) {
+        dst[i] = sum;
+      }
     }
   }
 

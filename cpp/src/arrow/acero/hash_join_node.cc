@@ -744,7 +744,7 @@ class HashJoinNode : public ExecNode, public TracedNode {
     //
     bool use_swiss_join;
 #if ARROW_LITTLE_ENDIAN
-    use_swiss_join = !schema_mgr->HasDictionaries() && !schema_mgr->HasLargeBinary();
+    use_swiss_join = !schema_mgr->HasDictionaries();
 #else
     use_swiss_join = false;
 #endif
