@@ -23,6 +23,11 @@
 namespace arrow {
 namespace acero {
 
+// 这些函数只被定义未被使用 包括arrow 13.0.0,15.0.0版本
+// 默认地址偏移为32bit 一次可以处理8个值，也就是说key数据总体大小不能超过4G (string 类型固定视为16B)
+// 一个变长字段16B 32位的偏移最多2^32/16=2^28=255,000,000 条记录
+// 对fixed-length和varbinary字段需要传入不同的PROCESS_8_VALUES_FN
+// 因为varbinary字段多一次寻址
 template <class PROCESS_8_VALUES_FN>
 int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int num_rows,
                                  const uint32_t* row_ids,
@@ -36,84 +41,27 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
       rows.metadata().column_metadatas[column_id].is_fixed_length;
 
   // There are 4 cases, each requiring different steps:
-  // 1. Varying length column that is the first varying length column in a row
-  // 2. Varying length column that is not the first varying length column in a
-  // row
-  // 3. Fixed length column in a fixed length row
-  // 4. Fixed length column in a varying length row
+  // 1. Varying length column 
+  // 2. Fixed length column 
 
   if (!is_fixed_length_column) {
     int varbinary_column_id = VarbinaryColumnId(rows.metadata(), column_id);
-    const uint8_t* row_ptr_base = rows.data(2);
-    const uint32_t* row_offsets = rows.offsets();
+    const uint8_t* row_ptr_base = rows.data(1);
+    __m256i row_length = _mm256_set1_epi32(rows.metadata().row_length());
 
-    if (varbinary_column_id == 0) {
-      // Case 1: This is the first varbinary column
-      //
-      __m256i field_offset_within_row = _mm256_set1_epi32(rows.metadata().fixed_length);
-      __m256i varbinary_end_array_offset =
-          _mm256_set1_epi32(rows.metadata().varbinary_end_array_offset);
-      for (int i = 0; i < num_rows / unroll; ++i) {
+    __m256i field_offset_within_row = 
+        _mm256_set1_epi32(
+            rows.metadata().nth_varbinary_offset_within_row(varbinary_column_id));
+    for (int i = 0; i < num_rows / unroll; ++i) {
         __m256i row_id =
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-        __m256i row_offset = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(row_offsets), row_id, sizeof(uint32_t));
-        __m256i field_length = _mm256_sub_epi32(
-            _mm256_i32gather_epi32(
-                reinterpret_cast<const int*>(row_ptr_base),
-                _mm256_add_epi32(row_offset, varbinary_end_array_offset), 1),
-            field_offset_within_row);
+        __m256i row_offset = _mm256_mullo_epi32(row_id, row_length);
+        // 此处field_length没有意义，在process_8_values_fn自行从binaryView内读取
+        __m256i field_length = _mm256_set1_epi32(0);
+    
         process_8_values_fn(i * unroll, row_ptr_base,
                             _mm256_add_epi32(row_offset, field_offset_within_row),
                             field_length);
-      }
-    } else {
-      // Case 2: This is second or later varbinary column
-      //
-      __m256i varbinary_end_array_offset =
-          _mm256_set1_epi32(rows.metadata().varbinary_end_array_offset +
-                            sizeof(uint32_t) * (varbinary_column_id - 1));
-      auto row_ptr_base_i64 =
-          reinterpret_cast<const arrow::util::int64_for_gather_t*>(row_ptr_base);
-      for (int i = 0; i < num_rows / unroll; ++i) {
-        __m256i row_id =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-        __m256i row_offset = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(row_offsets), row_id, sizeof(uint32_t));
-        __m256i end_array_offset =
-            _mm256_add_epi32(row_offset, varbinary_end_array_offset);
-
-        __m256i field_offset_within_row_A = _mm256_i32gather_epi64(
-            row_ptr_base_i64, _mm256_castsi256_si128(end_array_offset), 1);
-        __m256i field_offset_within_row_B = _mm256_i32gather_epi64(
-            row_ptr_base_i64, _mm256_extracti128_si256(end_array_offset, 1), 1);
-        field_offset_within_row_A = _mm256_permutevar8x32_epi32(
-            field_offset_within_row_A, _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7));
-        field_offset_within_row_B = _mm256_permutevar8x32_epi32(
-            field_offset_within_row_B, _mm256_setr_epi32(1, 3, 5, 7, 0, 2, 4, 6));
-
-        __m256i field_offset_within_row = _mm256_blend_epi32(
-            field_offset_within_row_A, field_offset_within_row_B, 0xf0);
-
-        __m256i alignment_padding =
-            _mm256_andnot_si256(field_offset_within_row, _mm256_set1_epi8(0xff));
-        alignment_padding = _mm256_add_epi32(alignment_padding, _mm256_set1_epi32(1));
-        alignment_padding = _mm256_and_si256(
-            alignment_padding, _mm256_set1_epi32(rows.metadata().string_alignment - 1));
-
-        field_offset_within_row =
-            _mm256_add_epi32(field_offset_within_row, alignment_padding);
-
-        __m256i field_length = _mm256_blend_epi32(field_offset_within_row_A,
-                                                  field_offset_within_row_B, 0x0f);
-        field_length = _mm256_permute4x64_epi64(field_length,
-                                                0x4e);  // Swapping low and high 128-bits
-        field_length = _mm256_sub_epi32(field_length, field_offset_within_row);
-
-        process_8_values_fn(i * unroll, row_ptr_base,
-                            _mm256_add_epi32(row_offset, field_offset_within_row),
-                            field_length);
-      }
     }
   }
 
@@ -122,33 +70,17 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
         _mm256_set1_epi32(rows.metadata().encoded_field_offset(
             rows.metadata().pos_after_encoding(column_id)));
     __m256i field_length =
-        _mm256_set1_epi32(rows.metadata().column_metadatas[column_id].fixed_length);
+        _mm256_set1_epi32(rows.metadata().row_length());
 
-    bool is_fixed_length_row = rows.metadata().is_fixed_length;
-    if (is_fixed_length_row) {
-      // Case 3: This is a fixed length column in fixed length row
-      //
-      const uint8_t* row_ptr_base = rows.data(1);
-      for (int i = 0; i < num_rows / unroll; ++i) {
-        __m256i row_id =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-        __m256i row_offset = _mm256_mullo_epi32(row_id, field_length);
-        __m256i field_offset = _mm256_add_epi32(row_offset, field_offset_within_row);
-        process_8_values_fn(i * unroll, row_ptr_base, field_offset, field_length);
-      }
-    } else {
-      // Case 4: This is a fixed length column in varying length row
-      //
-      const uint8_t* row_ptr_base = rows.data(2);
-      const uint32_t* row_offsets = rows.offsets();
-      for (int i = 0; i < num_rows / unroll; ++i) {
-        __m256i row_id =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-        __m256i row_offset = _mm256_i32gather_epi32(
-            reinterpret_cast<const int*>(row_offsets), row_id, sizeof(uint32_t));
-        __m256i field_offset = _mm256_add_epi32(row_offset, field_offset_within_row);
-        process_8_values_fn(i * unroll, row_ptr_base, field_offset, field_length);
-      }
+    // Case 3: This is a fixed length column
+    //
+    const uint8_t* row_ptr_base = rows.data(1);
+    for (int i = 0; i < num_rows / unroll; ++i) {
+      __m256i row_id =
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
+      __m256i row_offset = _mm256_mullo_epi32(row_id, field_length);
+      __m256i field_offset = _mm256_add_epi32(row_offset, field_offset_within_row);
+      process_8_values_fn(i * unroll, row_ptr_base, field_offset, field_length);
     }
   }
 

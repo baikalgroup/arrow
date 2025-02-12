@@ -73,6 +73,10 @@ struct ARROW_EXPORT KeyColumnMetadata {
   ///
   /// For a varying-length binary column this represents the number of bytes per offset.
   uint32_t fixed_length;
+
+  bool is_large_binary() const { return !is_fixed_length && fixed_length == sizeof(uint64_t); }
+
+  bool is_binary() const { return !is_fixed_length && fixed_length == sizeof(uint32_t); }
 };
 
 /// \brief A lightweight view into a "key" array
@@ -353,7 +357,7 @@ class ARROW_EXPORT ResizableArrayData {
   MemoryPool* pool_;
   int num_rows_;
   int num_rows_allocated_;
-  int64_t var_len_buf_size_;
+  uint64_t var_len_buf_size_;
   static constexpr int kMaxBuffers = 3;
   std::shared_ptr<ResizableBuffer> buffers_[kMaxBuffers];
 };

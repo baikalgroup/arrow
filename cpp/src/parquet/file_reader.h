@@ -27,6 +27,7 @@
 #include "parquet/metadata.h"  // IWYU pragma: keep
 #include "parquet/platform.h"
 #include "parquet/properties.h"
+#include "parquet/page_index.h"
 
 namespace parquet {
 
@@ -36,10 +37,14 @@ class PageIndexReader;
 class BloomFilterReader;
 class PageReader;
 class RowGroupMetaData;
+struct PageReaderContext;
 
 namespace internal {
 class RecordReader;
 }
+
+using RowRangeItem = std::pair<int64_t, int64_t>;
+using RowRange = std::vector<RowRangeItem>;
 
 class PARQUET_EXPORT RowGroupReader {
  public:
@@ -48,7 +53,8 @@ class PARQUET_EXPORT RowGroupReader {
   // An implementation of the Contents class is defined in the .cc file
   struct Contents {
     virtual ~Contents() {}
-    virtual std::unique_ptr<PageReader> GetColumnPageReader(int i) = 0;
+    virtual std::unique_ptr<PageReader> GetColumnPageReader(int i, 
+            std::shared_ptr<PageReaderContext> page_reader_ctx = nullptr) = 0;
     virtual const RowGroupMetaData* metadata() const = 0;
     virtual const ReaderProperties* properties() const = 0;
   };
@@ -93,7 +99,8 @@ class PARQUET_EXPORT RowGroupReader {
   std::shared_ptr<internal::RecordReader> RecordReaderWithExposeEncoding(
       int i, ExposedEncoding encoding_to_expose);
 
-  std::unique_ptr<PageReader> GetColumnPageReader(int i);
+  std::unique_ptr<PageReader> GetColumnPageReader(int i, 
+      std::shared_ptr<PageReaderContext> page_reader_ctx = nullptr);
 
  private:
   // Holds a pointer to an instance of Contents implementation

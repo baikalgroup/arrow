@@ -128,7 +128,7 @@ class ARROW_EXPORT SwissTable {
   ///            represents end of block).
   /// \param[out] out_match_found an integer flag (0 or 1) indicating if we reached an
   /// empty slot (0) or not (1). Therefore 1 can mean that either actual match was found
-  /// (case a) above) or we reached the end of full block (case b) above).
+  /// (case a) above) or we reached the end of full block (case c) above).
   ///
   template <bool use_start_slot>
   inline void search_block(uint64_t block, int stamp, int start_slot, int* out_slot,

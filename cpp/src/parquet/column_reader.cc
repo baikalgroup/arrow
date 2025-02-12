@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #include "arrow/array.h"
 #include "arrow/array/array_binary.h"
@@ -47,6 +48,7 @@
 #include "arrow/util/unreachable.h"
 #include "parquet/column_page.h"
 #include "parquet/encoding.h"
+#include "parquet/page_index.h"
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/encryption/internal_file_decryptor.h"
 #include "parquet/level_comparison.h"
@@ -257,16 +259,34 @@ void CheckNumValuesInHeader(int num_values) {
 // and the page metadata.
 class SerializedPageReader : public PageReader {
  public:
-  SerializedPageReader(std::shared_ptr<ArrowInputStream> stream, int64_t total_num_values,
-                       Compression::type codec, const ReaderProperties& properties,
-                       const CryptoContext* crypto_ctx, bool always_compressed)
+  SerializedPageReader(std::shared_ptr<ArrowInputStream> stream, 
+                       int64_t total_num_values,
+                       Compression::type codec, 
+                       const ReaderProperties& properties,
+                       const CryptoContext* crypto_ctx, 
+                       bool always_compressed, 
+                       std::shared_ptr<const PageReaderContext> page_reader_ctx = nullptr)
       : properties_(properties),
         stream_(std::move(stream)),
         decompression_buffer_(AllocateBuffer(properties_.memory_pool(), 0)),
         page_ordinal_(0),
         seen_num_values_(0),
         total_num_values_(total_num_values),
-        decryption_buffer_(AllocateBuffer(properties_.memory_pool(), 0)) {
+        decryption_buffer_(AllocateBuffer(properties_.memory_pool(), 0)),
+        current_page_idx_(0),
+        page_reader_ctx_(page_reader_ctx) {
+    if (use_row_range()) {
+      if (page_reader_ctx->offset_index == nullptr) {
+        throw ParquetException("offset index must be provided");
+      }
+      for(const auto& it: page_reader_ctx->row_range) {
+        row_range_queue_.push_back(it);
+      }
+      const std::vector<PageLocation>& page_locations = page_reader_ctx->offset_index->page_locations();
+      data_page_start_read_pos_ = page_locations[0].offset;
+      last_read_pos_ = page_reader_ctx->start_pos;
+      has_more_dictionary_page_ = (data_page_start_read_pos_ > page_reader_ctx->start_pos);
+    }
     if (crypto_ctx != nullptr) {
       crypto_ctx_ = *crypto_ctx;
       InitDecryption();
@@ -286,7 +306,32 @@ class SerializedPageReader : public PageReader {
 
   void set_max_page_header_size(uint32_t size) override { max_page_header_size_ = size; }
 
- private:
+  bool use_row_range() const override {
+    return page_reader_ctx_ && page_reader_ctx_->use_row_range;
+  }
+
+  // 当前 **page** 需要读取的row range的queue格式
+  std::deque<RowRangeItem> current_page_to_read() const override {
+    std::deque<RowRangeItem> to_read_queue;
+    if (!use_row_range()) {
+      return to_read_queue;
+    }
+    for (const auto& it: current_page_to_read_) {
+      to_read_queue.emplace_back(it);
+    }
+    return to_read_queue;
+  }
+
+ protected:
+  /** 
+   * @brief 判断是否还有page需要读取, use_row_range_为true时还会把读取的offset设置到下一个要读取的page的开头位置
+   * @return 返回true表示还需要读取page，返回false表示不再需要读取下一个page
+   * 返回false的两种可能:
+   * 1. 已经读完最后一个page
+   * 2. row range指定的行已被全部读出
+   */
+  bool HasNextPageToRead();
+
   void UpdateDecryption(const std::shared_ptr<Decryptor>& decryptor, int8_t module_type,
                         std::string* page_aad);
 
@@ -342,6 +387,17 @@ class SerializedPageReader : public PageReader {
   std::string data_page_header_aad_;
   // Encryption
   std::shared_ptr<ResizableBuffer> decryption_buffer_;
+
+  // following variables are only used when use_row_range() return true
+  std::shared_ptr<const PageReaderContext> page_reader_ctx_;
+
+  int current_page_idx_;
+  RowRange current_page_to_read_;
+  std::deque<RowRangeItem> row_range_queue_;
+  uint64_t last_read_pos_;
+  uint64_t data_page_start_read_pos_;
+
+  bool has_more_dictionary_page_;
 };
 
 void SerializedPageReader::InitDecryption() {
@@ -424,15 +480,16 @@ bool SerializedPageReader::ShouldSkipPage(EncodedStatistics* data_page_statistic
 std::shared_ptr<Page> SerializedPageReader::NextPage() {
   ThriftDeserializer deserializer(properties_);
 
-  // Loop here because there may be unhandled page types that we skip until
-  // finding a page that we do know what to do with
-  while (seen_num_values_ < total_num_values_) {
+  // use_row_range 时seen_num_values_ 会少加一些数据, 判断逻辑依赖 HasNextPageToRead()
+  // HasNextPageToRead() 总比 后者先返回false
+  // seen_num_values_ < total_num_values_ 已放在 HasNextPageToRead() 判断
+  while (HasNextPageToRead()) {
     uint32_t header_size = 0;
     uint32_t allowed_page_size = kDefaultPageHeaderSize;
 
-    // Page headers can be very large because of page statistics
-    // We try to deserialize a larger buffer progressively
-    // until a maximum allowed header limit
+      // Page headers can be very large because of page statistics
+      // We try to deserialize a larger buffer progressively
+      // until a maximum allowed header limit
     while (true) {
       PARQUET_ASSIGN_OR_THROW(auto view, stream_->Peek(allowed_page_size));
       if (view.size() == 0) return nullptr;
@@ -442,7 +499,7 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
       try {
         if (crypto_ctx_.meta_decryptor != nullptr) {
           UpdateDecryption(crypto_ctx_.meta_decryptor, encryption::kDictionaryPageHeader,
-                           &data_page_header_aad_);
+                          &data_page_header_aad_);
         }
         // Reset current page header to avoid unclearing the __isset flag.
         current_page_header_ = format::PageHeader();
@@ -461,8 +518,9 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
         }
       }
     }
-    // Advance the stream offset
+      // Advance the stream offset
     PARQUET_THROW_NOT_OK(stream_->Advance(header_size));
+    last_read_pos_ += header_size;
 
     int compressed_len = current_page_header_.compressed_page_size;
     int uncompressed_len = current_page_header_.uncompressed_page_size;
@@ -473,20 +531,22 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
     EncodedStatistics data_page_statistics;
     if (ShouldSkipPage(&data_page_statistics)) {
       PARQUET_THROW_NOT_OK(stream_->Advance(compressed_len));
+      last_read_pos_ += compressed_len;
       continue;
     }
 
     if (crypto_ctx_.data_decryptor != nullptr) {
       UpdateDecryption(crypto_ctx_.data_decryptor, encryption::kDictionaryPage,
-                       &data_page_aad_);
+                      &data_page_aad_);
     }
 
     // Read the compressed data page.
     PARQUET_ASSIGN_OR_THROW(auto page_buffer, stream_->Read(compressed_len));
+    last_read_pos_ += compressed_len;
     if (page_buffer->size() != compressed_len) {
       std::stringstream ss;
       ss << "Page was smaller (" << page_buffer->size() << ") than expected ("
-         << compressed_len << ")";
+        << compressed_len << ")";
       ParquetException::EofException(ss.str());
     }
 
@@ -524,7 +584,8 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
 
       page_buffer =
           DecompressIfNeeded(std::move(page_buffer), compressed_len, uncompressed_len);
-
+      
+      has_more_dictionary_page_ = (last_read_pos_ < data_page_start_read_pos_);
       return std::make_shared<DictionaryPage>(page_buffer, dict_header.num_values,
                                               LoadEnumSafe(&dict_header.encoding),
                                               is_sorted);
@@ -558,7 +619,7 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
       // it's page type-agnostic.
       if (is_compressed) {
         page_buffer = DecompressIfNeeded(std::move(page_buffer), compressed_len,
-                                         uncompressed_len, levels_byte_len);
+                                        uncompressed_len, levels_byte_len);
       }
 
       return std::make_shared<DataPageV2>(
@@ -610,6 +671,61 @@ std::shared_ptr<Buffer> SerializedPageReader::DecompressIfNeeded(
   return decompression_buffer_;
 }
 
+// 快速跳转到下一个需要读取的datapage，如果还存在dictionary_page会直接返回true
+bool SerializedPageReader::HasNextPageToRead() {
+  if (!use_row_range()) {
+    return seen_num_values_ < total_num_values_;
+  }
+  if (!has_more_dictionary_page_) {
+    // 数据读完了
+    if (row_range_queue_.empty()) {
+      return false;
+    }
+    current_page_to_read_.clear();
+    const std::vector<PageLocation>& page_locations = page_reader_ctx_->offset_index->page_locations();
+    int max_page_idx = page_locations.size() - 1;
+    
+    auto start_row = row_range_queue_.front().first;
+
+    // 新区间的开始已经超过 row group 的最大行号，直接返回 false
+    if (start_row > page_reader_ctx_->max_row_id) {
+      return false;
+    }
+    while (current_page_idx_ < max_page_idx
+            && page_locations[current_page_idx_ + 1].first_row_index <= start_row) {
+      ++ current_page_idx_;
+    }
+    int64_t current_page_max_row_idx = 
+                current_page_idx_ == max_page_idx ? 
+                        page_reader_ctx_->max_row_id :
+                        page_locations[current_page_idx_ + 1].first_row_index - 1;
+    while (!row_range_queue_.empty() 
+              && row_range_queue_.front().first <= current_page_max_row_idx) {
+      int64_t current_page_min_row_idx = page_locations[current_page_idx_].first_row_index;
+      int64_t range_end = row_range_queue_.front().second;
+      if (range_end <= current_page_max_row_idx) {
+        auto range_segment = row_range_queue_.front();
+        range_segment.first -= current_page_min_row_idx;
+        range_segment.second -= current_page_min_row_idx;
+        current_page_to_read_.emplace_back(range_segment);
+
+        row_range_queue_.pop_front();
+      } else {
+        current_page_to_read_.emplace_back(row_range_queue_.front().first - current_page_min_row_idx, 
+                                            current_page_max_row_idx - current_page_min_row_idx);
+        row_range_queue_.front().first = current_page_max_row_idx + 1;
+        break;
+      }
+    }
+
+    
+    const PageLocation& page_location = page_locations[current_page_idx_];
+    PARQUET_THROW_NOT_OK(stream_->Advance(page_location.offset - last_read_pos_));
+    last_read_pos_ = page_location.offset;
+    ++ current_page_idx_;
+  }
+  return true;
+}
 }  // namespace
 
 std::unique_ptr<PageReader> PageReader::Open(std::shared_ptr<ArrowInputStream> stream,
@@ -617,9 +733,11 @@ std::unique_ptr<PageReader> PageReader::Open(std::shared_ptr<ArrowInputStream> s
                                              Compression::type codec,
                                              const ReaderProperties& properties,
                                              bool always_compressed,
-                                             const CryptoContext* ctx) {
+                                             const CryptoContext* ctx,
+                                             std::shared_ptr<const PageReaderContext> page_reader_ctx) {
   return std::unique_ptr<PageReader>(new SerializedPageReader(
-      std::move(stream), total_num_values, codec, properties, ctx, always_compressed));
+      std::move(stream), total_num_values, codec, properties, ctx, always_compressed, 
+      page_reader_ctx));
 }
 
 std::unique_ptr<PageReader> PageReader::Open(std::shared_ptr<ArrowInputStream> stream,
@@ -627,10 +745,11 @@ std::unique_ptr<PageReader> PageReader::Open(std::shared_ptr<ArrowInputStream> s
                                              Compression::type codec,
                                              bool always_compressed,
                                              ::arrow::MemoryPool* pool,
-                                             const CryptoContext* ctx) {
+                                             const CryptoContext* ctx,
+                                             std::shared_ptr<const PageReaderContext> page_reader_ctx) {
   return std::unique_ptr<PageReader>(
       new SerializedPageReader(std::move(stream), total_num_values, codec,
-                               ReaderProperties(pool), ctx, always_compressed));
+                              ReaderProperties(pool), ctx, always_compressed, page_reader_ctx));
 }
 
 namespace {
@@ -1357,8 +1476,106 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     decoder->GetDictionary(&dictionary, dictionary_length);
     return reinterpret_cast<const void*>(dictionary);
   }
+  bool use_row_range() {
+    return this->pager_->use_row_range();
+  }
 
+  /**
+   * @brief 当前page上读取num_records条记录需要skip、read、skip、read ...的长度向量
+   *        比如第一个page范围是[0, 100],读取的row_range 为 {{5， 10}, {80, 90}}，本次需要读取10行
+   *        则游标位置为0，这需要{skip: 5, read: 6, skip: 69, read: 4},总共读取10行，游标更新到84
+   * @param num_records 输入 读取的行数
+   * @param skip_read_vec 输出 返回skip、read的长度向量
+   * @return 返回当前page上能读取的行数，异常情况返回-1
+   */
+  int64_t BatchReadPlan(int64_t num_records, std::deque<int64_t>* skip_read_vec) {
+    if (!use_row_range() && !skip_read_vec) {
+      return -1;
+    }
+    skip_read_vec->clear();
+    int64_t row_num = 0;
+    std::deque<RowRangeItem>& to_read = this->current_page_to_read_;
+    auto segment_length = [](const RowRangeItem& item) -> uint64_t { return item.second - item.first + 1; };
+    while (!to_read.empty() 
+            && num_records >= row_num + segment_length(to_read.front())) {
+      int64_t segment_read = segment_length(to_read.front());
+      skip_read_vec->emplace_back(to_read.front().first - last_read_row_id_ - 1);
+      skip_read_vec->emplace_back(segment_read);
+      last_read_row_id_ = to_read.front().second;
+      row_num += segment_read;
+      to_read.pop_front();
+    }
+
+    int64_t remain = num_records - row_num;
+
+    if (to_read.empty() || remain == 0) {
+      return row_num;
+    }
+
+    auto& read_range = to_read.front();
+    skip_read_vec->emplace_back(read_range.first - last_read_row_id_ - 1);
+    skip_read_vec->emplace_back(remain);
+    last_read_row_id_ = read_range.first + remain - 1;
+    row_num += remain;
+    read_range.first = last_read_row_id_ + 1;
+
+    return row_num;
+  }
+
+  // current_page_to_read_ 不为空表示本page的数据还没读取完，返回true
+  // ReadNewPage() 不返回空指针表示还有新page需要读取，返回true
+  bool HasNextRecord() {
+    if(this->current_page_to_read_.empty()){
+      if(this->ReadNewPage()) {
+        last_read_row_id_ = -1;
+
+        if (use_row_range()) {
+          current_page_to_read_ = this->pager_->current_page_to_read();
+        }
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // 目前只支持非list和结构化数据
+  // 如果保证每个page的第一个数据的repetition level为0，则也可以正确读取list的结构化数据
+  int64_t ReadRecordsWithRowRange(int64_t num_records) {
+    if (num_records == 0) return 0;
+
+    int64_t records_read = 0;
+    std::deque<int64_t> skip_read_queue;
+    
+    while (records_read < num_records) {
+      if (!HasNextRecord()) {
+        break;
+      }
+
+      int64_t records_read_from_current_page = BatchReadPlan(num_records - records_read, &skip_read_queue);
+      
+      while (!skip_read_queue.empty()) {
+        SkipRecords(skip_read_queue.front());
+        skip_read_queue.pop_front();
+
+        int read = ReadContiniousRecords(skip_read_queue.front());
+        records_read += read;
+        skip_read_queue.pop_front();
+      }
+    }
+
+    return records_read;
+  }
+  
   int64_t ReadRecords(int64_t num_records) override {
+    if (use_row_range()) {
+      return ReadRecordsWithRowRange(num_records);
+    } else {
+      return ReadContiniousRecords(num_records);
+    }
+  }
+
+  int64_t ReadContiniousRecords(int64_t num_records) {
     if (num_records == 0) return 0;
     // Delimit records, then read values at the end
     int64_t records_read = 0;
@@ -2016,6 +2233,8 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
     return values_->mutable_data_as<T>() + values_written_;
   }
   LevelInfo leaf_info_;
+  int64_t last_read_row_id_ = -1;
+  std::deque<RowRangeItem> current_page_to_read_;
 };
 
 class FLBARecordReader final : public TypedRecordReader<FLBAType>,

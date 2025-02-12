@@ -21,6 +21,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #include "parquet/exception.h"
 #include "parquet/level_conversion.h"
@@ -29,6 +30,7 @@
 #include "parquet/properties.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
+#include "parquet/file_reader.h"
 
 namespace arrow {
 
@@ -118,6 +120,19 @@ struct CryptoContext {
   std::shared_ptr<Decryptor> data_decryptor;
 };
 
+struct PageReaderContext {
+  explicit PageReaderContext(const RowRange& row_range): 
+      row_range(row_range), use_row_range(true) {}
+  PageReaderContext(): use_row_range(false) {}
+
+  bool use_row_range = false;
+  RowRange row_range;
+  std::shared_ptr<OffsetIndex> offset_index;
+  uint64_t start_pos;
+  // 当前row group内最大的row id，无法通过offset_index得到
+  uint64_t max_row_id;
+};
+
 // Abstract page iterator interface. This way, we can feed column pages to the
 // ColumnReader through whatever mechanism we choose
 class PARQUET_EXPORT PageReader {
@@ -126,17 +141,21 @@ class PARQUET_EXPORT PageReader {
  public:
   virtual ~PageReader() = default;
 
-  static std::unique_ptr<PageReader> Open(
-      std::shared_ptr<ArrowInputStream> stream, int64_t total_num_values,
-      Compression::type codec, bool always_compressed = false,
-      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
-      const CryptoContext* ctx = NULLPTR);
+  static std::unique_ptr<PageReader> Open(std::shared_ptr<ArrowInputStream> stream, 
+                                          int64_t total_num_values,
+                                          Compression::type codec, 
+                                          bool always_compressed = false,
+                                          ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
+                                          const CryptoContext* ctx = NULLPTR, 
+                                          std::shared_ptr<const PageReaderContext> page_reader_ctx = nullptr);
+
   static std::unique_ptr<PageReader> Open(std::shared_ptr<ArrowInputStream> stream,
                                           int64_t total_num_values,
                                           Compression::type codec,
                                           const ReaderProperties& properties,
                                           bool always_compressed = false,
-                                          const CryptoContext* ctx = NULLPTR);
+                                          const CryptoContext* ctx = NULLPTR,
+                                          std::shared_ptr<const PageReaderContext> page_reader_ctx = nullptr);
 
   // If data_page_filter is present (not null), NextPage() will call the
   // callback function exactly once per page in the order the pages appear in
@@ -150,6 +169,16 @@ class PARQUET_EXPORT PageReader {
     data_page_filter_ = std::move(data_page_filter);
   }
 
+  void set_page_reader_context(std::shared_ptr<PageReaderContext> page_reader_ctx) {
+    page_reader_ctx_ = std::move(page_reader_ctx);
+    page_reader_ctx_set_ = true;
+  }
+
+  void unset_page_reader_context() { 
+    page_reader_ctx_set_ = false;
+    page_reader_ctx_.reset();
+  }
+
   // @returns: shared_ptr<Page>(nullptr) on EOS, std::shared_ptr<Page>
   // containing new Page otherwise
   //
@@ -159,9 +188,15 @@ class PARQUET_EXPORT PageReader {
 
   virtual void set_max_page_header_size(uint32_t size) = 0;
 
+  virtual bool use_row_range() const = 0;
+  virtual std::deque<RowRangeItem> current_page_to_read() const = 0;
+
  protected:
   // Callback that decides if we should skip a page or not.
   DataPageFilter data_page_filter_;
+
+  bool page_reader_ctx_set_;
+  std::shared_ptr<PageReaderContext> page_reader_ctx_;
 };
 
 class PARQUET_EXPORT ColumnReader {

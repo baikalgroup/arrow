@@ -716,7 +716,11 @@ std::shared_ptr<CastFunction> GetCastToInteger(std::string name) {
   auto out_ty = TypeTraits<OutType>::type_singleton();
 
   for (const std::shared_ptr<DataType>& in_ty : IntTypes()) {
-    DCHECK_OK(func->AddKernel(in_ty->id(), {in_ty}, out_ty, CastIntegerToInteger));
+    if (in_ty->id() == out_ty->id()) {
+      AddZeroCopyCast(in_ty->id(), in_ty, out_ty, func.get());
+    } else {
+      DCHECK_OK(func->AddKernel(in_ty->id(), {in_ty}, out_ty, CastIntegerToInteger));
+    }
   }
 
   // Cast from floating point
@@ -751,7 +755,11 @@ std::shared_ptr<CastFunction> GetCastToFloating(std::string name) {
 
   // Cast from floating point
   for (const std::shared_ptr<DataType>& in_ty : FloatingPointTypes()) {
-    DCHECK_OK(func->AddKernel(in_ty->id(), {in_ty}, out_ty, CastFloatingToFloating));
+    if (in_ty->id() == out_ty->id()) {
+      AddZeroCopyCast(in_ty->id(), in_ty, out_ty, func.get());
+    } else {
+      DCHECK_OK(func->AddKernel(in_ty->id(), {in_ty}, out_ty, CastFloatingToFloating));
+    }
   }
 
   // From half-float to float/double
