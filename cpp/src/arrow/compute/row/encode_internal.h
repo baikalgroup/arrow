@@ -82,7 +82,6 @@ class ARROW_EXPORT RowTableEncoder {
   /// buffers.
   /// The output can be used to find out required varying length buffers sizes
   /// for the call to DecodeVaryingLengthBuffers
-  /// 暂时只被grouper用到
   void DecodeFixedLengthBuffers(int64_t start_row_input, int64_t start_row_output,
                                 int64_t num_rows, const RowTableImpl& rows,
                                 std::vector<KeyColumnArray>* cols, int64_t hardware_flags,

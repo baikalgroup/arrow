@@ -25,7 +25,6 @@
 namespace arrow {
 namespace compute {
 
-#ifdef ARROW_HAVE_RUNTIME_AVX2
 inline __m256i set_first_n_bytes_avx2(int n) {
   constexpr uint64_t kByteSequence0To7 = 0x0706050403020100ULL;
   constexpr uint64_t kByteSequence8To15 = 0x0f0e0d0c0b0a0908ULL;
@@ -641,7 +640,6 @@ uint32_t KeyCompare::CompareVarBinaryColumnToRow_avx2(
 
   return num_rows_to_compare;
 }
-#endif
 
 }  // namespace compute
 }  // namespace arrow
