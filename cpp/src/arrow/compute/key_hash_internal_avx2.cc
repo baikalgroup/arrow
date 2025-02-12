@@ -23,7 +23,6 @@
 namespace arrow {
 namespace compute {
 
-#ifdef ARROW_HAVE_RUNTIME_AVX2
 inline __m256i Hashing32::Avalanche_avx2(__m256i hash) {
   hash = _mm256_xor_si256(hash, _mm256_srli_epi32(hash, 15));
   hash = _mm256_mullo_epi32(hash, _mm256_set1_epi32(PRIME32_2));
@@ -313,7 +312,6 @@ uint32_t Hashing32::HashVarLen_avx2(bool combine_hashes, uint32_t num_rows,
                                                hashes, hashes_temp_for_combine);
   }
 }
-#endif
 
 }  // namespace compute
 }  // namespace arrow
