@@ -39,6 +39,7 @@ using compute::Hashing32;
 using compute::KeyCompare;
 using compute::LightContext;
 using compute::SwissTable;
+using compute::BinaryView;
 
 namespace acero {
 
@@ -69,24 +70,17 @@ int RowArrayAccessor::NumRowsToSkip(const RowTableImpl& rows, int column_id, int
     // Varying length column
     //
     int varbinary_column_id = VarbinaryColumnId(rows.metadata(), column_id);
+    const uint32_t row_width = rows.metadata().row_length();
 
     while (num_rows_left > 0 &&
            num_bytes_skipped < static_cast<uint32_t>(num_tail_bytes_to_skip)) {
       // Find the pointer to the last requested row
       //
       uint32_t last_row_id = row_ids[num_rows_left - 1];
-      const uint8_t* row_ptr = rows.data(2) + rows.offsets()[last_row_id];
+      const uint8_t* row_ptr = rows.data(1) + row_width * last_row_id;
 
-      // Find the length of the requested varying length field in that row
-      //
-      uint32_t field_offset_within_row, field_length;
-      if (varbinary_column_id == 0) {
-        rows.metadata().first_varbinary_offset_and_length(
-            row_ptr, &field_offset_within_row, &field_length);
-      } else {
-        rows.metadata().nth_varbinary_offset_and_length(
-            row_ptr, varbinary_column_id, &field_offset_within_row, &field_length);
-      }
+      const BinaryView* varbinary_view = rows.metadata().nth_varbinary_ptr(row_ptr, varbinary_column_id);
+      uint32_t field_length = varbinary_view->length();
 
       num_bytes_skipped += field_length;
       --num_rows_left;
@@ -109,42 +103,24 @@ int RowArrayAccessor::NumRowsToSkip(const RowTableImpl& rows, int column_id, int
 template <class PROCESS_VALUE_FN>
 void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_rows,
                              const uint32_t* row_ids, PROCESS_VALUE_FN process_value_fn) {
-  bool is_fixed_length_column =
-      rows.metadata().column_metadatas[column_id].is_fixed_length;
+  const RowTableMetadata& metadata = rows.metadata();
+  
+  bool is_fixed_length_column = metadata.column_metadatas[column_id].is_fixed_length;
 
-  // There are 4 cases, each requiring different steps:
-  // 1. Varying length column that is the first varying length column in a row
-  // 2. Varying length column that is not the first varying length column in a
-  // row
-  // 3. Fixed length column in a fixed length row
-  // 4. Fixed length column in a varying length row
+  // There are 2 cases, each requiring different steps:
+  // 1. Varying length column 
+  // 2. Fixed length column
 
   if (!is_fixed_length_column) {
+    const uint8_t* row_ptr_base = rows.data(1);
     int varbinary_column_id = VarbinaryColumnId(rows.metadata(), column_id);
-    const uint8_t* row_ptr_base = rows.data(2);
-    const uint32_t* row_offsets = rows.offsets();
-    uint32_t field_offset_within_row, field_length;
+    uint32_t single_row_width = metadata.row_length();
 
-    if (varbinary_column_id == 0) {
-      // Case 1: This is the first varbinary column
-      //
-      for (int i = 0; i < num_rows; ++i) {
-        uint32_t row_id = row_ids[i];
-        const uint8_t* row_ptr = row_ptr_base + row_offsets[row_id];
-        rows.metadata().first_varbinary_offset_and_length(
-            row_ptr, &field_offset_within_row, &field_length);
-        process_value_fn(i, row_ptr + field_offset_within_row, field_length);
-      }
-    } else {
-      // Case 2: This is second or later varbinary column
-      //
-      for (int i = 0; i < num_rows; ++i) {
-        uint32_t row_id = row_ids[i];
-        const uint8_t* row_ptr = row_ptr_base + row_offsets[row_id];
-        rows.metadata().nth_varbinary_offset_and_length(
-            row_ptr, varbinary_column_id, &field_offset_within_row, &field_length);
-        process_value_fn(i, row_ptr + field_offset_within_row, field_length);
-      }
+    for (int i = 0; i < num_rows; ++i) {
+      uint32_t row_id = row_ids[i];
+      const uint8_t* row_ptr = row_ptr_base + row_id * single_row_width;
+      const BinaryView* varbinary_view_ptr = metadata.nth_varbinary_ptr(row_ptr, varbinary_column_id);
+      process_value_fn(i, varbinary_view_ptr->data(), varbinary_view_ptr->length());
     }
   }
 
@@ -157,28 +133,13 @@ void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_ro
     if (field_length == 0) {
       field_length = 1;
     }
-    uint32_t row_length = rows.metadata().fixed_length;
+    uint32_t row_length = rows.metadata().row_length();
 
-    bool is_fixed_length_row = rows.metadata().is_fixed_length;
-    if (is_fixed_length_row) {
-      // Case 3: This is a fixed length column in a fixed length row
-      //
-      const uint8_t* row_ptr_base = rows.data(1) + field_offset_within_row;
-      for (int i = 0; i < num_rows; ++i) {
-        uint32_t row_id = row_ids[i];
-        const uint8_t* row_ptr = row_ptr_base + row_length * row_id;
-        process_value_fn(i, row_ptr, field_length);
-      }
-    } else {
-      // Case 4: This is a fixed length column in a varying length row
-      //
-      const uint8_t* row_ptr_base = rows.data(2) + field_offset_within_row;
-      const uint32_t* row_offsets = rows.offsets();
-      for (int i = 0; i < num_rows; ++i) {
-        uint32_t row_id = row_ids[i];
-        const uint8_t* row_ptr = row_ptr_base + row_offsets[row_id];
-        process_value_fn(i, row_ptr, field_length);
-      }
+    const uint8_t* row_ptr_base = rows.data(1) + field_offset_within_row;
+    for (int i = 0; i < num_rows; ++i) {
+      uint32_t row_id = row_ids[i];
+      const uint8_t* row_ptr = row_ptr_base + row_length * row_id;
+      process_value_fn(i, row_ptr, field_length);
     }
   }
 }
@@ -215,8 +176,7 @@ Status RowArray::InitIfNeeded(MemoryPool* pool, const ExecBatch& batch) {
   std::vector<KeyColumnMetadata> column_metadatas;
   RETURN_NOT_OK(ColumnMetadatasFromExecBatch(batch, &column_metadatas));
   RowTableMetadata row_metadata;
-  row_metadata.FromColumnMetadataVector(column_metadatas, sizeof(uint64_t),
-                                        sizeof(uint64_t));
+  row_metadata.FromColumnMetadataVector(column_metadatas, sizeof(uint64_t));
 
   return InitIfNeeded(pool, row_metadata);
 }
@@ -324,33 +284,65 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
         break;
     }
   } else {
-    uint32_t* offsets =
-        reinterpret_cast<uint32_t*>(output->mutable_data(1)) + num_rows_before;
-    uint32_t sum = num_rows_before == 0 ? 0 : offsets[0];
-    RowArrayAccessor::Visit(
-        rows_, column_id, num_rows_to_append, row_ids,
-        [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; });
-    for (int i = 0; i < num_rows_to_append; ++i) {
-      uint32_t length = offsets[i];
-      offsets[i] = sum;
-      sum += length;
+    bool is_large_binary = column_metadata.is_large_binary();
+    // large binary 使用64位的offset
+    if (is_large_binary) {
+        uint64_t* offsets =
+          reinterpret_cast<uint64_t*>(output->mutable_data(1)) + num_rows_before;
+      uint64_t sum = num_rows_before == 0 ? 0 : offsets[0];
+      RowArrayAccessor::Visit(
+          rows_, column_id, num_rows_to_append, row_ids,
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; });
+      for (int i = 0; i < num_rows_to_append; ++i) {
+        uint64_t length = offsets[i];
+        offsets[i] = sum;
+        sum += length;
+      }
+      offsets[num_rows_to_append] = sum;
+      RETURN_NOT_OK(output->ResizeVaryingLengthBuffer());
+      RowArrayAccessor::Visit(
+          rows_, column_id, num_rows_to_append, row_ids,
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
+            uint64_t* dst = reinterpret_cast<uint64_t*>(
+                output->mutable_data(2) +
+                reinterpret_cast<const uint64_t*>(
+                    output->mutable_data(1))[num_rows_before + i]);
+            const uint64_t* src = reinterpret_cast<const uint64_t*>(ptr);
+            for (uint32_t word_id = 0;
+                word_id < bit_util::CeilDiv(num_bytes, sizeof(uint64_t)); ++word_id) {
+              arrow::util::SafeStore<uint64_t>(dst + word_id,
+                                              arrow::util::SafeLoad(src + word_id));
+            }
+          });
+    } else {
+        uint32_t* offsets =
+          reinterpret_cast<uint32_t*>(output->mutable_data(1)) + num_rows_before;
+      uint32_t sum = num_rows_before == 0 ? 0 : offsets[0];
+      RowArrayAccessor::Visit(
+          rows_, column_id, num_rows_to_append, row_ids,
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; });
+      for (int i = 0; i < num_rows_to_append; ++i) {
+        uint32_t length = offsets[i];
+        offsets[i] = sum;
+        sum += length;
+      }
+      offsets[num_rows_to_append] = sum;
+      RETURN_NOT_OK(output->ResizeVaryingLengthBuffer());
+      RowArrayAccessor::Visit(
+          rows_, column_id, num_rows_to_append, row_ids,
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
+            uint64_t* dst = reinterpret_cast<uint64_t*>(
+                output->mutable_data(2) +
+                reinterpret_cast<const uint32_t*>(
+                    output->mutable_data(1))[num_rows_before + i]);
+            const uint64_t* src = reinterpret_cast<const uint64_t*>(ptr);
+            for (uint32_t word_id = 0;
+                word_id < bit_util::CeilDiv(num_bytes, sizeof(uint64_t)); ++word_id) {
+              arrow::util::SafeStore<uint64_t>(dst + word_id,
+                                              arrow::util::SafeLoad(src + word_id));
+            }
+          });
     }
-    offsets[num_rows_to_append] = sum;
-    RETURN_NOT_OK(output->ResizeVaryingLengthBuffer());
-    RowArrayAccessor::Visit(
-        rows_, column_id, num_rows_to_append, row_ids,
-        [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
-          uint64_t* dst = reinterpret_cast<uint64_t*>(
-              output->mutable_data(2) +
-              reinterpret_cast<const uint32_t*>(
-                  output->mutable_data(1))[num_rows_before + i]);
-          const uint64_t* src = reinterpret_cast<const uint64_t*>(ptr);
-          for (uint32_t word_id = 0;
-               word_id < bit_util::CeilDiv(num_bytes, sizeof(uint64_t)); ++word_id) {
-            arrow::util::SafeStore<uint64_t>(dst + word_id,
-                                             arrow::util::SafeLoad(src + word_id));
-          }
-        });
   }
 
   // Process nulls
@@ -465,15 +457,12 @@ Status RowArrayMerge::PrepareForMerge(RowArray* target,
       (*first_target_row_id)[i] = num_rows;
     }
     num_rows += sources[i]->rows_.length();
-    if (!metadata.is_fixed_length) {
-      num_bytes += sources[i]->rows_.offsets()[sources[i]->rows_.length()];
-    }
   }
   if (first_target_row_id) {
     (*first_target_row_id)[sources.size()] = num_rows;
   }
 
-  if (num_bytes > std::numeric_limits<uint32_t>::max()) {
+  if (num_bytes > std::numeric_limits<uint32_t>::max() && metadata.include_binary) {
     return Status::Invalid(
         "There are more than 2^32 bytes of key data.  Acero cannot "
         "process a join of this magnitude");
@@ -482,23 +471,7 @@ Status RowArrayMerge::PrepareForMerge(RowArray* target,
   // Allocate target memory
   //
   target->rows_.Clean();
-  RETURN_NOT_OK(target->rows_.AppendEmpty(static_cast<uint32_t>(num_rows),
-                                          static_cast<uint32_t>(num_bytes)));
-
-  // In case of varying length rows,
-  // initialize the first row offset for each range of rows corresponding to a
-  // single source.
-  //
-  if (!metadata.is_fixed_length) {
-    num_rows = 0;
-    num_bytes = 0;
-    for (size_t i = 0; i < sources.size(); ++i) {
-      target->rows_.mutable_offsets()[num_rows] = static_cast<uint32_t>(num_bytes);
-      num_rows += sources[i]->rows_.length();
-      num_bytes += sources[i]->rows_.offsets()[sources[i]->rows_.length()];
-    }
-    target->rows_.mutable_offsets()[num_rows] = static_cast<uint32_t>(num_bytes);
-  }
+  RETURN_NOT_OK(target->rows_.AppendEmpty(static_cast<uint32_t>(num_rows)));
 
   return Status::OK();
 }
@@ -515,97 +488,41 @@ void RowArrayMerge::MergeSingle(RowArray* target, const RowArray& source,
   ARROW_DCHECK(target->rows_.metadata().is_compatible(source.rows_.metadata()));
   ARROW_DCHECK(target->rows_.metadata().row_alignment == sizeof(uint64_t));
 
-  if (target->rows_.metadata().is_fixed_length) {
-    CopyFixedLength(&target->rows_, source.rows_, first_target_row_id,
+  CopyFixedVarLength(&target->rows_, source.rows_, first_target_row_id,
                     source_rows_permutation);
-  } else {
-    CopyVaryingLength(&target->rows_, source.rows_, first_target_row_id,
-                      target->rows_.offsets()[first_target_row_id],
-                      source_rows_permutation);
-  }
   CopyNulls(&target->rows_, source.rows_, first_target_row_id, source_rows_permutation);
 }
 
-void RowArrayMerge::CopyFixedLength(RowTableImpl* target, const RowTableImpl& source,
+void RowArrayMerge::CopyFixedVarLength(RowTableImpl* target, const RowTableImpl& source,
                                     int64_t first_target_row_id,
                                     const int64_t* source_rows_permutation) {
   int64_t num_source_rows = source.length();
 
-  int64_t fixed_length = target->metadata().fixed_length;
+  int64_t row_width = target->metadata().row_length();
 
   // Permutation of source rows is optional. Without permutation all that is
   // needed is memcpy.
   //
   if (!source_rows_permutation) {
-    memcpy(target->mutable_data(1) + fixed_length * first_target_row_id, source.data(1),
-           fixed_length * num_source_rows);
+    memcpy(target->mutable_data(1) + row_width * first_target_row_id, source.data(1),
+           row_width * num_source_rows);
   } else {
     // Row length must be a multiple of 64-bits due to enforced alignment.
     // Loop for each output row copying a fixed number of 64-bit words.
     //
-    ARROW_DCHECK(fixed_length % sizeof(uint64_t) == 0);
+    ARROW_DCHECK(row_width % sizeof(uint64_t) == 0);
 
-    int64_t num_words_per_row = fixed_length / sizeof(uint64_t);
+    int64_t num_words_per_row = row_width / sizeof(uint64_t);
     for (int64_t i = 0; i < num_source_rows; ++i) {
       int64_t source_row_id = source_rows_permutation[i];
       const uint64_t* source_row_ptr = reinterpret_cast<const uint64_t*>(
-          source.data(1) + fixed_length * source_row_id);
+          source.data(1) + row_width * source_row_id);
       uint64_t* target_row_ptr = reinterpret_cast<uint64_t*>(
-          target->mutable_data(1) + fixed_length * (first_target_row_id + i));
+          target->mutable_data(1) + row_width * (first_target_row_id + i));
 
       for (int64_t word = 0; word < num_words_per_row; ++word) {
         target_row_ptr[word] = source_row_ptr[word];
       }
-    }
-  }
-}
-
-void RowArrayMerge::CopyVaryingLength(RowTableImpl* target, const RowTableImpl& source,
-                                      int64_t first_target_row_id,
-                                      int64_t first_target_row_offset,
-                                      const int64_t* source_rows_permutation) {
-  int64_t num_source_rows = source.length();
-  uint32_t* target_offsets = target->mutable_offsets();
-  const uint32_t* source_offsets = source.offsets();
-
-  // Permutation of source rows is optional.
-  //
-  if (!source_rows_permutation) {
-    int64_t target_row_offset = first_target_row_offset;
-    for (int64_t i = 0; i < num_source_rows; ++i) {
-      target_offsets[first_target_row_id + i] = static_cast<uint32_t>(target_row_offset);
-      target_row_offset += source_offsets[i + 1] - source_offsets[i];
-    }
-    // We purposefully skip outputting of N+1 offset, to allow concurrent
-    // copies of rows done to adjacent ranges in target array.
-    // It should have already been initialized during preparation for merge.
-    //
-
-    // We can simply memcpy bytes of rows if their order has not changed.
-    //
-    memcpy(target->mutable_data(2) + target_offsets[first_target_row_id], source.data(2),
-           source_offsets[num_source_rows] - source_offsets[0]);
-  } else {
-    int64_t target_row_offset = first_target_row_offset;
-    uint64_t* target_row_ptr =
-        reinterpret_cast<uint64_t*>(target->mutable_data(2) + target_row_offset);
-    for (int64_t i = 0; i < num_source_rows; ++i) {
-      int64_t source_row_id = source_rows_permutation[i];
-      const uint64_t* source_row_ptr = reinterpret_cast<const uint64_t*>(
-          source.data(2) + source_offsets[source_row_id]);
-      uint32_t length = source_offsets[source_row_id + 1] - source_offsets[source_row_id];
-
-      // Rows should be 64-bit aligned.
-      // In that case we can copy them using a sequence of 64-bit read/writes.
-      //
-      ARROW_DCHECK(length % sizeof(uint64_t) == 0);
-
-      for (uint32_t word = 0; word < length / sizeof(uint64_t); ++word) {
-        *target_row_ptr++ = *source_row_ptr++;
-      }
-
-      target_offsets[first_target_row_id + i] = static_cast<uint32_t>(target_row_offset);
-      target_row_offset += length;
     }
   }
 }
@@ -1171,12 +1088,10 @@ Status SwissTableForJoinBuild::Init(SwissTableForJoin* target, int dop, int64_t 
 
   RowTableMetadata key_row_metadata;
   key_row_metadata.FromColumnMetadataVector(key_types,
-                                            /*row_alignment=*/sizeof(uint64_t),
-                                            /*string_alignment=*/sizeof(uint64_t));
+                                            /*row_alignment=*/sizeof(uint64_t));
   RowTableMetadata payload_row_metadata;
   payload_row_metadata.FromColumnMetadataVector(payload_types,
-                                                /*row_alignment=*/sizeof(uint64_t),
-                                                /*string_alignment=*/sizeof(uint64_t));
+                                                /*row_alignment=*/sizeof(uint64_t));
 
   for (int i = 0; i < num_prtns_; ++i) {
     PartitionState& prtn_state = prtn_states_[i];
@@ -2482,7 +2397,6 @@ class SwissJoin : public HashJoinImpl {
                        {{"detail", filter.ToString()},
                         {"join.kind", arrow::acero::ToString(join_type)},
                         {"join.threads", static_cast<uint32_t>(num_threads)}});
-
     num_threads_ = static_cast<int>(num_threads);
     ctx_ = ctx;
     hardware_flags_ = ctx->cpu_info()->hardware_flags();
@@ -2686,7 +2600,7 @@ class SwissJoin : public HashJoinImpl {
         temp_stack)));
 
     // Release input batch
-    //
+    // NOTE 在这里释放了input
     input_batch.values.clear();
 
     return Status::OK();
@@ -2695,7 +2609,8 @@ class SwissJoin : public HashJoinImpl {
   Status BuildFinished(size_t thread_id) {
     RETURN_NOT_OK(status());
 
-    build_side_batches_.Clear();
+    // NOTE 这里暂时不clear, 延迟到ScanFinished
+    // build_side_batches_.Clear();
 
     // On a single thread prepare for merging partitions of the resulting hash
     // table.
@@ -2863,6 +2778,9 @@ class SwissJoin : public HashJoinImpl {
       JoinResultMaterialize& materialize = local_states_[i].materialize;
       num_produced_batches += materialize.num_produced_batches();
     }
+
+    // NOTE: 延迟到scan结束clear
+    build_side_batches_.Clear();
 
     return finished_callback_(num_produced_batches);
   }

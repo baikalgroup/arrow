@@ -15,19 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow/util/bpacking_avx2.h"
-#include "arrow/util/bpacking_simd256_generated_internal.h"
-#include "arrow/util/bpacking_simd_internal.h"
+#ifndef PARQUET_VERSION_H
+#define PARQUET_VERSION_H
 
-namespace arrow {
-namespace internal {
+#define PARQUET_VERSION_MAJOR 16
+#define PARQUET_VERSION_MINOR 1 
+#define PARQUET_VERSION_PATCH 0
 
-#ifdef ARROW_HAVE_RUNTIME_AVX2
-int unpack32_avx2(const uint32_t* in, uint32_t* out, int batch_size, int num_bits) {
-  return unpack32_specialized<UnpackBits256<DispatchLevel::AVX2>>(in, out, batch_size,
-                                                                  num_bits);
-}
-#endif
+#define PARQUET_SO_VERSION "1601"
+#define PARQUET_FULL_SO_VERSION "1601.0.0"
 
-}  // namespace internal
-}  // namespace arrow
+// define the parquet created by version
+#define CREATED_BY_VERSION "parquet-cpp-arrow version 16.1.0"
+
+#endif  // PARQUET_VERSION_H

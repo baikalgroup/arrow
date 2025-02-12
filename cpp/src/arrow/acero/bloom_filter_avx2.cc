@@ -23,6 +23,7 @@
 namespace arrow {
 namespace acero {
 
+#ifdef ARROW_HAVE_RUNTIME_AVX2
 inline __m256i BlockedBloomFilter::mask_avx2(__m256i hash) const {
   // AVX2 translation of mask() method
   //
@@ -130,6 +131,7 @@ int64_t BlockedBloomFilter::Insert_avx2(int64_t num_rows, const uint32_t* hashes
 int64_t BlockedBloomFilter::Insert_avx2(int64_t num_rows, const uint64_t* hashes) {
   return InsertImp_avx2(num_rows, hashes);
 }
+#endif // ARROW_HAVE_RUNTIME_AVX2
 
 }  // namespace acero
 }  // namespace arrow

@@ -21,6 +21,7 @@ namespace arrow {
 namespace compute {
 namespace internal {
 
+#ifdef ARROW_HAVE_RUNTIME_AVX2
 // ----------------------------------------------------------------------
 // Sum implementation
 
@@ -83,6 +84,7 @@ void AddMinMaxAvx2AggKernels(ScalarAggregateFunction* func) {
   AddMinMaxKernel(MinMaxInitAvx2, Type::INTERVAL_MONTHS, func, SimdLevel::AVX2);
 }
 
+#endif
 }  // namespace internal
 }  // namespace compute
 }  // namespace arrow

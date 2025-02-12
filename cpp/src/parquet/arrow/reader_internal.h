@@ -62,11 +62,17 @@ class ColumnReaderImpl;
 class FileColumnIterator {
  public:
   explicit FileColumnIterator(int column_index, ParquetFileReader* reader,
-                              std::vector<int> row_groups)
+                              std::vector<int> row_groups,
+                              std::shared_ptr<std::vector<RowRange>> row_ranges)
       : column_index_(column_index),
         reader_(reader),
         schema_(reader->metadata()->schema()),
-        row_groups_(row_groups.begin(), row_groups.end()) {}
+        row_groups_(row_groups.begin(), row_groups.end()) {
+          use_row_range_ = row_ranges != nullptr;
+          if (use_row_range_){
+            row_ranges_ = std::deque<RowRange>(row_ranges->begin(), row_ranges->end());
+          }
+        }
 
   virtual ~FileColumnIterator() {}
 
@@ -77,7 +83,12 @@ class FileColumnIterator {
 
     auto row_group_reader = reader_->RowGroup(row_groups_.front());
     row_groups_.pop_front();
-    return row_group_reader->GetColumnPageReader(column_index_);
+    std::shared_ptr<PageReaderContext> page_reader_ctx;
+    if (use_row_range_) {
+      page_reader_ctx = std::make_shared<PageReaderContext>(row_ranges_.front());
+      row_ranges_.pop_front();
+    }    
+    return row_group_reader->GetColumnPageReader(column_index_, page_reader_ctx);
   }
 
   const SchemaDescriptor* schema() const { return schema_; }
@@ -93,6 +104,8 @@ class FileColumnIterator {
   ParquetFileReader* reader_;
   const SchemaDescriptor* schema_;
   std::deque<int> row_groups_;
+  std::deque<RowRange> row_ranges_;
+  bool use_row_range_;
 };
 
 using FileColumnIteratorFactory =

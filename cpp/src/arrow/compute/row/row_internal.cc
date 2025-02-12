@@ -53,8 +53,7 @@ bool RowTableMetadata::is_compatible(const RowTableMetadata& other) const {
 }
 
 void RowTableMetadata::FromColumnMetadataVector(
-    const std::vector<KeyColumnMetadata>& cols, int in_row_alignment,
-    int in_string_alignment) {
+    const std::vector<KeyColumnMetadata>& cols, int in_row_alignment) {
   column_metadatas.resize(cols.size());
   for (size_t i = 0; i < cols.size(); ++i) {
     column_metadatas[i] = cols[i];
@@ -116,28 +115,37 @@ void RowTableMetadata::FromColumnMetadataVector(
   }
 
   row_alignment = in_row_alignment;
-  string_alignment = in_string_alignment;
-  varbinary_end_array_offset = 0;
+  string_alignment = in_row_alignment;
 
   column_offsets.resize(num_cols);
   uint32_t num_varbinary_cols = 0;
   uint32_t offset_within_row = 0;
+  fixed_length = 0;
+  include_binary = false;
   for (uint32_t i = 0; i < num_cols; ++i) {
     const KeyColumnMetadata& col = cols[column_order[i]];
     if (col.is_fixed_length && col.fixed_length != 0 &&
         ARROW_POPCOUNT64(col.fixed_length) != 1) {
       offset_within_row += RowTableMetadata::padding_for_alignment(offset_within_row,
-                                                                   string_alignment, col);
+                                                                   row_alignment, col);
     }
     column_offsets[i] = offset_within_row;
     if (!col.is_fixed_length) {
+      include_binary = include_binary || (col.fixed_length == sizeof(uint32_t));
       if (num_varbinary_cols == 0) {
-        varbinary_end_array_offset = offset_within_row;
+          // 确定fixed 字段长度
+        fixed_length =
+          offset_within_row +
+          RowTableMetadata::padding_for_alignment(offset_within_row, row_alignment);
+        // varbinary_end_array_offset = fixed_length;
+        offset_within_row = fixed_length;
+        // 变长字段会对齐存放，导致column_offsets[i]不是上一个字段结束的地方
+        column_offsets[i] = offset_within_row;
       }
-      DCHECK(column_offsets[i] - varbinary_end_array_offset ==
-             num_varbinary_cols * sizeof(uint32_t));
+      DCHECK(column_offsets[i] - fixed_length ==
+             num_varbinary_cols * kBinaryViewSize);
       ++num_varbinary_cols;
-      offset_within_row += sizeof(uint32_t);
+      offset_within_row += kBinaryViewSize;
     } else {
       // Boolean column is a bit-vector, which is indicated by
       // setting fixed length in column metadata to zero.
@@ -147,14 +155,25 @@ void RowTableMetadata::FromColumnMetadataVector(
       } else {
         offset_within_row += col.fixed_length;
       }
+      // fixed_length = offset_within_row;
     }
+  }
+  if (num_varbinary_cols == 0) {
+      // 确定fixed 字段长度
+    fixed_length =
+      offset_within_row +
+      RowTableMetadata::padding_for_alignment(offset_within_row, row_alignment);
+    // varbinary_end_array_offset = fixed_length;
+    offset_within_row = fixed_length;
   }
 
   is_fixed_length = (num_varbinary_cols == 0);
-  fixed_length =
-      offset_within_row +
-      RowTableMetadata::padding_for_alignment(
-          offset_within_row, num_varbinary_cols == 0 ? row_alignment : string_alignment);
+  varbinary_size = num_varbinary_cols;
+  varbinary_view_length = varbinary_size * kBinaryViewSize;
+  // fixed_length =
+  //     offset_within_row +
+  //     RowTableMetadata::padding_for_alignment(
+  //         offset_within_row, num_varbinary_cols == 0 ? row_alignment : string_alignment);
 
   // We set the number of bytes per row storing null masks of individual key columns
   // to be a power of two. This is not required. It could be also set to the minimal
@@ -171,7 +190,7 @@ Status RowTableImpl::Init(MemoryPool* pool, const RowTableMetadata& metadata) {
   pool_ = pool;
   metadata_ = metadata;
 
-  DCHECK(!null_masks_ && !offsets_ && !rows_);
+  DCHECK(!null_masks_ && !rows_);
 
   constexpr int64_t kInitialRowsCapacity = 8;
   constexpr int64_t kInitialBytesCapacity = 1024;
@@ -182,30 +201,13 @@ Status RowTableImpl::Init(MemoryPool* pool, const RowTableMetadata& metadata) {
       AllocateResizableBuffer(size_null_masks(kInitialRowsCapacity), pool_));
   null_masks_ = std::move(null_masks);
   memset(null_masks_->mutable_data(), 0, size_null_masks(kInitialRowsCapacity));
-
-  // Offsets and rows
-  if (!metadata.is_fixed_length) {
-    ARROW_ASSIGN_OR_RAISE(
-        auto offsets, AllocateResizableBuffer(size_offsets(kInitialRowsCapacity), pool_));
-    offsets_ = std::move(offsets);
-    memset(offsets_->mutable_data(), 0, size_offsets(kInitialRowsCapacity));
-    reinterpret_cast<uint32_t*>(offsets_->mutable_data())[0] = 0;
-
-    ARROW_ASSIGN_OR_RAISE(
-        auto rows,
-        AllocateResizableBuffer(size_rows_varying_length(kInitialBytesCapacity), pool_));
-    rows_ = std::move(rows);
-    memset(rows_->mutable_data(), 0, size_rows_varying_length(kInitialBytesCapacity));
-    bytes_capacity_ =
-        size_rows_varying_length(kInitialBytesCapacity) - kPaddingForVectors;
-  } else {
-    ARROW_ASSIGN_OR_RAISE(
-        auto rows,
-        AllocateResizableBuffer(size_rows_fixed_length(kInitialRowsCapacity), pool_));
-    rows_ = std::move(rows);
-    memset(rows_->mutable_data(), 0, size_rows_fixed_length(kInitialRowsCapacity));
-    bytes_capacity_ = size_rows_fixed_length(kInitialRowsCapacity) - kPaddingForVectors;
-  }
+  
+  ARROW_ASSIGN_OR_RAISE(
+      auto rows,
+      AllocateResizableBuffer(size_rows(kInitialRowsCapacity), pool_));
+  rows_ = std::move(rows);
+  memset(rows_->mutable_data(), 0, size_rows(kInitialRowsCapacity));
+  bytes_capacity_ = size_rows(kInitialRowsCapacity) - kPaddingForVectors;
 
   UpdateBufferPointers();
 
@@ -222,40 +224,22 @@ void RowTableImpl::Clean() {
   num_rows_ = 0;
   num_rows_for_has_any_nulls_ = 0;
   has_any_nulls_ = false;
-
-  if (!metadata_.is_fixed_length) {
-    reinterpret_cast<uint32_t*>(offsets_->mutable_data())[0] = 0;
-  }
 }
 
 int64_t RowTableImpl::size_null_masks(int64_t num_rows) const {
   return num_rows * metadata_.null_masks_bytes_per_row + kPaddingForVectors;
 }
 
-int64_t RowTableImpl::size_offsets(int64_t num_rows) const {
-  return (num_rows + 1) * sizeof(uint32_t) + kPaddingForVectors;
-}
-
-int64_t RowTableImpl::size_rows_fixed_length(int64_t num_rows) const {
-  return num_rows * metadata_.fixed_length + kPaddingForVectors;
-}
-
-int64_t RowTableImpl::size_rows_varying_length(int64_t num_bytes) const {
-  return num_bytes + kPaddingForVectors;
+int64_t RowTableImpl::size_rows(int64_t num_rows) const {
+  return num_rows * (metadata_.fixed_length + metadata_.varbinary_view_length) + kPaddingForVectors;
 }
 
 void RowTableImpl::UpdateBufferPointers() {
   buffers_[0] = null_masks_->mutable_data();
-  if (metadata_.is_fixed_length) {
-    buffers_[1] = rows_->mutable_data();
-    buffers_[2] = nullptr;
-  } else {
-    buffers_[1] = offsets_->mutable_data();
-    buffers_[2] = rows_->mutable_data();
-  }
+  buffers_[1] = rows_->mutable_data();
 }
 
-Status RowTableImpl::ResizeFixedLengthBuffers(int64_t num_extra_rows) {
+Status RowTableImpl::ResizeBuffers(int64_t num_extra_rows) {
   if (rows_capacity_ >= num_rows_ + num_extra_rows) {
     return Status::OK();
   }
@@ -270,45 +254,15 @@ Status RowTableImpl::ResizeFixedLengthBuffers(int64_t num_extra_rows) {
   memset(null_masks_->mutable_data() + size_null_masks(rows_capacity_), 0,
          size_null_masks(rows_capacity_new) - size_null_masks(rows_capacity_));
 
-  // Either offsets or rows
-  if (!metadata_.is_fixed_length) {
-    RETURN_NOT_OK(offsets_->Resize(size_offsets(rows_capacity_new), false));
-    memset(offsets_->mutable_data() + size_offsets(rows_capacity_), 0,
-           size_offsets(rows_capacity_new) - size_offsets(rows_capacity_));
-  } else {
-    RETURN_NOT_OK(rows_->Resize(size_rows_fixed_length(rows_capacity_new), false));
-    memset(rows_->mutable_data() + size_rows_fixed_length(rows_capacity_), 0,
-           size_rows_fixed_length(rows_capacity_new) -
-               size_rows_fixed_length(rows_capacity_));
-    bytes_capacity_ = size_rows_fixed_length(rows_capacity_new) - kPaddingForVectors;
-  }
+  RETURN_NOT_OK(rows_->Resize(size_rows(rows_capacity_new), false));
+  memset(rows_->mutable_data() + size_rows(rows_capacity_), 0,
+          size_rows(rows_capacity_new) -
+              size_rows(rows_capacity_));
+  bytes_capacity_ = size_rows(rows_capacity_new) - kPaddingForVectors;
 
   UpdateBufferPointers();
 
   rows_capacity_ = rows_capacity_new;
-
-  return Status::OK();
-}
-
-Status RowTableImpl::ResizeOptionalVaryingLengthBuffer(int64_t num_extra_bytes) {
-  int64_t num_bytes = offsets()[num_rows_];
-  if (bytes_capacity_ >= num_bytes + num_extra_bytes || metadata_.is_fixed_length) {
-    return Status::OK();
-  }
-
-  int64_t bytes_capacity_new = std::max(static_cast<int64_t>(1), 2 * bytes_capacity_);
-  while (bytes_capacity_new < num_bytes + num_extra_bytes) {
-    bytes_capacity_new *= 2;
-  }
-
-  RETURN_NOT_OK(rows_->Resize(size_rows_varying_length(bytes_capacity_new), false));
-  memset(rows_->mutable_data() + size_rows_varying_length(bytes_capacity_), 0,
-         size_rows_varying_length(bytes_capacity_new) -
-             size_rows_varying_length(bytes_capacity_));
-
-  UpdateBufferPointers();
-
-  bytes_capacity_ = bytes_capacity_new;
 
   return Status::OK();
 }
@@ -318,49 +272,19 @@ Status RowTableImpl::AppendSelectionFrom(const RowTableImpl& from,
                                          const uint16_t* source_row_ids) {
   DCHECK(metadata_.is_compatible(from.metadata()));
 
-  RETURN_NOT_OK(ResizeFixedLengthBuffers(num_rows_to_append));
+  RETURN_NOT_OK(ResizeBuffers(num_rows_to_append));
 
-  if (!metadata_.is_fixed_length) {
-    // Varying-length rows
-    auto from_offsets = reinterpret_cast<const uint32_t*>(from.offsets_->data());
-    auto to_offsets = reinterpret_cast<uint32_t*>(offsets_->mutable_data());
-    uint32_t total_length = to_offsets[num_rows_];
-    uint32_t total_length_to_append = 0;
-    for (uint32_t i = 0; i < num_rows_to_append; ++i) {
-      uint16_t row_id = source_row_ids ? source_row_ids[i] : i;
-      uint32_t length = from_offsets[row_id + 1] - from_offsets[row_id];
-      total_length_to_append += length;
-      to_offsets[num_rows_ + i + 1] = total_length + total_length_to_append;
+  const uint8_t* src = from.rows_->data();
+  uint32_t length = metadata_.row_length();
+  uint8_t* dst = rows_->mutable_data() + num_rows_ * metadata_.row_length();
+  for (uint32_t i = 0; i < num_rows_to_append; ++i) {
+    uint16_t row_id = source_row_ids ? source_row_ids[i] : i;
+    auto src64 = reinterpret_cast<const uint64_t*>(src + length * row_id);
+    auto dst64 = reinterpret_cast<uint64_t*>(dst);
+    for (uint32_t j = 0; j < bit_util::CeilDiv(length, 8); ++j) {
+      dst64[j] = src64[j];
     }
-
-    RETURN_NOT_OK(ResizeOptionalVaryingLengthBuffer(total_length_to_append));
-
-    const uint8_t* src = from.rows_->data();
-    uint8_t* dst = rows_->mutable_data() + total_length;
-    for (uint32_t i = 0; i < num_rows_to_append; ++i) {
-      uint16_t row_id = source_row_ids ? source_row_ids[i] : i;
-      uint32_t length = from_offsets[row_id + 1] - from_offsets[row_id];
-      auto src64 = reinterpret_cast<const uint64_t*>(src + from_offsets[row_id]);
-      auto dst64 = reinterpret_cast<uint64_t*>(dst);
-      for (uint32_t j = 0; j < bit_util::CeilDiv(length, 8); ++j) {
-        dst64[j] = src64[j];
-      }
-      dst += length;
-    }
-  } else {
-    // Fixed-length rows
-    const uint8_t* src = from.rows_->data();
-    uint8_t* dst = rows_->mutable_data() + num_rows_ * metadata_.fixed_length;
-    for (uint32_t i = 0; i < num_rows_to_append; ++i) {
-      uint16_t row_id = source_row_ids ? source_row_ids[i] : i;
-      uint32_t length = metadata_.fixed_length;
-      auto src64 = reinterpret_cast<const uint64_t*>(src + length * row_id);
-      auto dst64 = reinterpret_cast<uint64_t*>(dst);
-      for (uint32_t j = 0; j < bit_util::CeilDiv(length, 8); ++j) {
-        dst64[j] = src64[j];
-      }
-      dst += length;
-    }
+    dst += length;
   }
 
   // Null masks
@@ -384,10 +308,8 @@ Status RowTableImpl::AppendSelectionFrom(const RowTableImpl& from,
   return Status::OK();
 }
 
-Status RowTableImpl::AppendEmpty(uint32_t num_rows_to_append,
-                                 uint32_t num_extra_bytes_to_append) {
-  RETURN_NOT_OK(ResizeFixedLengthBuffers(num_rows_to_append));
-  RETURN_NOT_OK(ResizeOptionalVaryingLengthBuffer(num_extra_bytes_to_append));
+Status RowTableImpl::AppendEmpty(uint32_t num_rows_to_append) {
+  RETURN_NOT_OK(ResizeBuffers(num_rows_to_append));
   num_rows_ += num_rows_to_append;
   if (metadata_.row_alignment > 1 || metadata_.string_alignment > 1) {
     memset(rows_->mutable_data(), 0, bytes_capacity_);

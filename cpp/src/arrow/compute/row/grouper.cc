@@ -38,11 +38,13 @@
 #include "arrow/util/cpu_info.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/task_group.h"
+#include "arrow/acero/accumulation_queue.h"
 
 namespace arrow {
 
 using internal::checked_cast;
 using internal::PrimitiveScalarBase;
+using acero::util::AccumulationQueue;
 
 namespace compute {
 
@@ -517,11 +519,11 @@ struct GrouperFastImpl : public Grouper {
       return false;
     }
 #if ARROW_LITTLE_ENDIAN
-    for (size_t i = 0; i < key_types.size(); ++i) {
-      if (is_large_binary_like(key_types[i].id())) {
-        return false;
-      }
-    }
+    // for (size_t i = 0; i < key_types.size(); ++i) {
+    //   if (is_large_binary_like(key_types[i].id())) {
+    //     return false;
+    //   }
+    // }
     return true;
 #else
     return false;
@@ -555,6 +557,8 @@ struct GrouperFastImpl : public Grouper {
             true, checked_cast<const FixedWidthType&>(*key).bit_width() / 8);
       } else if (is_binary_like(key.id())) {
         impl->col_metadata_[icol] = KeyColumnMetadata(false, sizeof(uint32_t));
+      } else if (is_large_binary_like(key.id())) {
+        impl->col_metadata_[icol] = KeyColumnMetadata(false, sizeof(uint64_t));
       } else if (key.id() == Type::NA) {
         impl->col_metadata_[icol] = KeyColumnMetadata(true, 0, /*is_null_type_in=*/true);
       } else {
@@ -712,7 +716,8 @@ struct GrouperFastImpl : public Grouper {
         minibatch_size_ *= 2;
       }
     }
-
+    // 保存所有batch防止被free
+    group_by_key_batches_.InsertBatch(batch.ToExecBatch());
     return Datum(UInt32Array(batch.length, std::move(group_ids)));
   }
 
@@ -761,7 +766,14 @@ struct GrouperFastImpl : public Grouper {
         }
       } else {
         ARROW_ASSIGN_OR_RAISE(fixedlen_bufs[i],
-                              AllocatePaddedBuffer((num_groups + 1) * sizeof(uint32_t)));
+                              AllocatePaddedBuffer((num_groups + 1) * col_metadata_[i].fixed_length));
+        // 变长列的定长部分为offset，格式为0,offset1,offset2...
+        // 初始化offset为0，防止num_groups == 0（空表）的情况下offset不会被初始化
+        if (col_metadata_[i].is_binary()) {
+          reinterpret_cast<uint32_t*>(fixedlen_bufs[i]->mutable_data())[0] = 0;
+        } else if (col_metadata_[i].is_large_binary()) {
+          reinterpret_cast<uint64_t*>(fixedlen_bufs[i]->mutable_data())[0] = 0;
+        }
       }
       cols_[i] =
           KeyColumnArray(col_metadata_[i], num_groups, non_null_bufs[i]->mutable_data(),
@@ -779,7 +791,9 @@ struct GrouperFastImpl : public Grouper {
     if (!rows_.metadata().is_fixed_length) {
       for (size_t i = 0; i < num_columns; ++i) {
         if (!col_metadata_[i].is_fixed_length) {
-          auto varlen_size =
+          bool is_large_binary = col_metadata_[i].is_large_binary();
+          auto varlen_size = is_large_binary?
+              reinterpret_cast<const uint64_t*>(fixedlen_bufs[i]->data())[num_groups]:
               reinterpret_cast<const uint32_t*>(fixedlen_bufs[i]->data())[num_groups];
           ARROW_ASSIGN_OR_RAISE(varlen_bufs[i], AllocatePaddedBuffer(varlen_size));
           cols_[i] = KeyColumnArray(
@@ -834,6 +848,8 @@ struct GrouperFastImpl : public Grouper {
         }
       }
     }
+    // 清理下游发上来的batch
+    group_by_key_batches_.Clear();
 
     return out;
   }
@@ -860,6 +876,7 @@ struct GrouperFastImpl : public Grouper {
   SwissTable map_;
   SwissTable::EqualImpl map_equal_impl_;
   SwissTable::AppendImpl map_append_impl_;
+  AccumulationQueue group_by_key_batches_;
 };
 
 }  // namespace

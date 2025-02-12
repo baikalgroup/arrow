@@ -23,6 +23,7 @@
 
 namespace arrow::util::bit_util::avx2 {
 
+#if defined(ARROW_HAVE_RUNTIME_AVX2) && defined(ARROW_HAVE_RUNTIME_BMI2)
 template <int bit_to_search>
 void bits_to_indexes_imp_avx2(const int num_bits, const uint8_t* bits, int* num_indexes,
                               uint16_t* indexes, uint16_t base_index = 0) {
@@ -208,5 +209,6 @@ bool are_all_bytes_zero_avx2(const uint8_t* bytes, uint32_t num_bytes) {
   }
   return result_or32 == 0;
 }
+#endif // defined(ARROW_HAVE_RUNTIME_AVX2) && defined(ARROW_HAVE_RUNTIME_BMI2)
 
 }  // namespace arrow::util::bit_util::avx2

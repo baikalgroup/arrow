@@ -28,31 +28,117 @@
 namespace arrow {
 namespace compute {
 
+
+// 默认单行不会超过4GB，对于二进制数据，ResizableArrayData 只会复制地址，不会复制内容
+struct ARROW_EXPORT BinaryView {
+  static constexpr size_t prefixSize = 4 * sizeof(char);
+  static constexpr size_t inlineSize = 12;
+
+  BinaryView() {
+    static_assert(sizeof(BinaryView) == 16);
+    memset(this, 0, sizeof(BinaryView));
+  }
+
+  BinaryView(const uint8_t* data, int32_t len) : size_(len) {
+    DCHECK(len == 0);
+    DCHECK(data || len == 0);
+    if (isInline()) {
+      // Zero the inline part.
+      // this makes sure that inline strings can be compared for equality with 2
+      // int64 compares.
+      if (size_ == 0) {
+        return;
+      }
+      // small string: inlined. Zero the last 8 bytes first to allow for whole
+      // word comparison.
+      memcpy(prefix_, data, size_);
+    } else {
+      value_.data = data;
+    }
+  }
+
+  BinaryView(const char* data, int32_t len) : BinaryView((const uint8_t *)data, len) {}
+
+  static BinaryView makeInline(const std::string& str) {
+    DCHECK(isInline(str.size()));
+    return BinaryView{str};
+  }
+
+  // Making BinaryView implicitly constructible/convertible from uint8_t* and
+  // string literals, in order to allow for a more flexible API and optional
+  // interoperability. E.g:
+  //
+  //   BinaryView sv = "literal";
+  //   std::optional<BinaryView> osv = "literal";
+  //
+  /* implicit */ BinaryView(const char* data)
+      : BinaryView(data, strlen(data)) {}
+
+  explicit BinaryView(const std::string& value)
+      : BinaryView(value.data(), value.size()) {}
+  explicit BinaryView(std::string&& value) = delete;
+
+  BinaryView& operator=(const BinaryView& other) {
+    if (this == &other) {
+      return *this;
+    }
+    size_ = other.size_;
+    if (isInline()) {
+      memcpy(prefix_, other.data(), size_);
+    } else {
+      value_.data = other.data();
+    }
+    return *this;
+  }
+
+  bool isInline() const {
+    return isInline(size_);
+  }
+
+  static constexpr bool isInline(uint32_t size) {
+    return size <= inlineSize;
+  }
+
+  const uint8_t* data() && = delete;
+  const uint8_t* data() const& {
+    return isInline() ? prefix_ : value_.data;
+  }
+
+  size_t size() const {
+    return size_;
+  }
+
+  size_t length() const {
+    return size_;
+  }
+private:
+  uint32_t size_;
+  uint8_t prefix_[4];
+  union {
+    uint8_t inlined[8];
+    const uint8_t* data;
+  } value_;
+};
+
 /// Description of the data stored in a RowTable
+/// fixed_length字段在前，然后跟着一个一个的varbinary字段,varbinary实际上是个BianryView，不拥有数据
 struct ARROW_EXPORT RowTableMetadata {
+  const static uint32_t kBinaryViewSize = sizeof(arrow::compute::BinaryView);
+
+  // 是否包括普通 binary
+  bool include_binary;
+
   /// \brief True if there are no variable length columns in the table
   bool is_fixed_length;
 
-  /// For a fixed-length binary row, common size of rows in bytes,
-  /// rounded up to the multiple of alignment.
-  ///
-  /// For a varying-length binary, size of all encoded fixed-length key columns,
-  /// including lengths of varying-length columns, rounded up to the multiple of string
-  /// alignment.
+  /// For a fixed-length part of the row
+  // 定长字段总长度，64bit对齐
   uint32_t fixed_length;
 
-  /// Offset within a row to the array of 32-bit offsets within a row of
-  /// ends of varbinary fields.
-  /// Used only when the row is not fixed-length, zero for fixed-length row.
-  /// There are N elements for N varbinary fields.
-  /// Each element is the offset within a row of the first byte after
-  /// the corresponding varbinary field bytes in that row.
-  /// If varbinary fields begin at aligned addresses, than the end of the previous
-  /// varbinary field needs to be rounded up according to the specified alignment
-  /// to obtain the beginning of the next varbinary field.
-  /// The first varbinary field starts at offset specified by fixed_length,
-  /// which should already be aligned.
-  uint32_t varbinary_end_array_offset;
+  // num of varbinary fields
+  uint32_t varbinary_size;
+  // varbinary_view_length = varbinary_size * kBinaryViewSize
+  uint32_t varbinary_view_length;
 
   /// Fixed number of bytes per row that are used to encode null masks.
   /// Null masks indicate for a single row which of its columns are null.
@@ -78,6 +164,22 @@ struct ARROW_EXPORT RowTableMetadata {
   /// Offsets within a row to fields in their encoding order.
   std::vector<uint32_t> column_offsets;
 
+  inline uint32_t row_length() const {
+    return fixed_length + varbinary_view_length;
+  }
+
+  const BinaryView* nth_varbinary_ptr(const uint8_t* row_base, uint32_t i) const {
+    return reinterpret_cast<const BinaryView*>(row_base + fixed_length + i * kBinaryViewSize);
+  }
+
+  int32_t nth_varbinary_offset_within_row(uint32_t i) const {
+    return fixed_length + i * kBinaryViewSize;
+  }
+
+  BinaryView* nth_mutable_varbinary_ptr(uint8_t* row_base, uint32_t i) const {
+    return reinterpret_cast<BinaryView*>(row_base + fixed_length + i * kBinaryViewSize);
+  }
+
   /// Rounding up offset to the nearest multiple of alignment value.
   /// Alignment must be a power of 2.
   static inline uint32_t padding_for_alignment(uint32_t offset, int required_alignment) {
@@ -98,40 +200,6 @@ struct ARROW_EXPORT RowTableMetadata {
     }
   }
 
-  /// Returns an array of offsets within a row of ends of varbinary fields.
-  inline const uint32_t* varbinary_end_array(const uint8_t* row) const {
-    ARROW_DCHECK(!is_fixed_length);
-    return reinterpret_cast<const uint32_t*>(row + varbinary_end_array_offset);
-  }
-
-  /// \brief An array of mutable offsets within a row of ends of varbinary fields.
-  inline uint32_t* varbinary_end_array(uint8_t* row) const {
-    ARROW_DCHECK(!is_fixed_length);
-    return reinterpret_cast<uint32_t*>(row + varbinary_end_array_offset);
-  }
-
-  /// Returns the offset within the row and length of the first varbinary field.
-  inline void first_varbinary_offset_and_length(const uint8_t* row, uint32_t* offset,
-                                                uint32_t* length) const {
-    ARROW_DCHECK(!is_fixed_length);
-    *offset = fixed_length;
-    *length = varbinary_end_array(row)[0] - fixed_length;
-  }
-
-  /// Returns the offset within the row and length of the second and further varbinary
-  /// fields.
-  inline void nth_varbinary_offset_and_length(const uint8_t* row, int varbinary_id,
-                                              uint32_t* out_offset,
-                                              uint32_t* out_length) const {
-    ARROW_DCHECK(!is_fixed_length);
-    ARROW_DCHECK(varbinary_id > 0);
-    const uint32_t* varbinary_end = varbinary_end_array(row);
-    uint32_t offset = varbinary_end[varbinary_id - 1];
-    offset += padding_for_alignment(offset, string_alignment);
-    *out_offset = offset;
-    *out_length = varbinary_end[varbinary_id] - offset;
-  }
-
   uint32_t encoded_field_order(uint32_t icol) const { return column_order[icol]; }
 
   uint32_t pos_after_encoding(uint32_t icol) const { return inverse_column_order[icol]; }
@@ -144,7 +212,7 @@ struct ARROW_EXPORT RowTableMetadata {
 
   /// \brief Populate this instance to describe `cols` with the given alignment
   void FromColumnMetadataVector(const std::vector<KeyColumnMetadata>& cols,
-                                int in_row_alignment, int in_string_alignment);
+                                int in_row_alignment);
 
   /// \brief True if `other` has the same number of columns
   ///   and each column has the same width (two variable length
@@ -162,6 +230,7 @@ struct ARROW_EXPORT RowTableMetadata {
 class ARROW_EXPORT RowTableImpl {
  public:
   RowTableImpl();
+
   /// \brief Initialize a row array for use
   ///
   /// This must be called before any other method
@@ -175,7 +244,11 @@ class ARROW_EXPORT RowTableImpl {
   /// \param num_extra_bytes_to_append For tables storing variable-length data this
   ///     should be a guess of how many data bytes will be needed to populate the
   ///     data.  This is ignored if there are no variable-length columns
-  Status AppendEmpty(uint32_t num_rows_to_append, uint32_t num_extra_bytes_to_append);
+  // Status AppendEmpty(uint32_t num_rows_to_append, uint32_t num_extra_bytes_to_append);
+
+  /// \brief Add empty rows
+  /// \param num_rows_to_append The number of empty rows to append
+  Status AppendEmpty(uint32_t num_rows_to_append);
   /// \brief Append rows from a source table
   /// \param from The table to append from
   /// \param num_rows_to_append The number of rows to append
@@ -195,8 +268,6 @@ class ARROW_EXPORT RowTableImpl {
     ARROW_DCHECK(i >= 0 && i < kMaxBuffers);
     return buffers_[i];
   }
-  const uint32_t* offsets() const { return reinterpret_cast<const uint32_t*>(data(1)); }
-  uint32_t* mutable_offsets() { return reinterpret_cast<uint32_t*>(mutable_data(1)); }
   const uint8_t* null_masks() const { return null_masks_->data(); }
   uint8_t* null_masks() { return null_masks_->mutable_data(); }
 
@@ -208,15 +279,12 @@ class ARROW_EXPORT RowTableImpl {
   bool has_any_nulls(const LightContext* ctx) const;
 
  private:
-  Status ResizeFixedLengthBuffers(int64_t num_extra_rows);
-  Status ResizeOptionalVaryingLengthBuffer(int64_t num_extra_bytes);
+  Status ResizeBuffers(int64_t num_extra_rows);
 
   // Helper functions to determine the number of bytes needed for each
   // buffer given a number of rows.
   int64_t size_null_masks(int64_t num_rows) const;
-  int64_t size_offsets(int64_t num_rows) const;
-  int64_t size_rows_fixed_length(int64_t num_rows) const;
-  int64_t size_rows_varying_length(int64_t num_bytes) const;
+  int64_t size_rows(int64_t num_rows) const;
 
   // Called after resize to fix pointers
   void UpdateBufferPointers();
@@ -229,13 +297,15 @@ class ARROW_EXPORT RowTableImpl {
   RowTableMetadata metadata_;
   // Buffers can only expand during lifetime and never shrink.
   std::unique_ptr<ResizableBuffer> null_masks_;
-  // Only used if the table has variable-length columns
-  // Stores the offsets into the binary data (which is stored
-  // after all the fixed-sized fields)
-  std::unique_ptr<ResizableBuffer> offsets_;
+  // // Only used if the table has variable-length columns
+  // // Stores the offsets into the binary data (which is stored
+  // // after all the fixed-sized fields)
+  // no longer used
+  // std::unique_ptr<ResizableBuffer> offsets_;
+
   // Stores the fixed-length parts of the rows
   std::unique_ptr<ResizableBuffer> rows_;
-  static constexpr int kMaxBuffers = 3;
+  static constexpr int kMaxBuffers = 2;
   uint8_t* buffers_[kMaxBuffers];
   // The number of rows in the table
   int64_t num_rows_;
