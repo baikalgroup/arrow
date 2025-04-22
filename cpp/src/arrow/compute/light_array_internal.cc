@@ -476,8 +476,8 @@ void ExecBatchBuilder::Visit(const std::shared_ptr<ArrayData>& column, int num_r
     const uint8_t* ptr_base = column->buffers[2]->data();
     bool is_large_binary = metadata.is_large_binary();
     
-    const uint64_t* offsets64 = column->GetValues<uint64_t>(1) + column->offset;
-    const uint32_t* offsets32 = column->GetValues<uint32_t>(1) + column->offset;
+    const uint64_t* offsets64 = column->GetValues<uint64_t>(1);
+    const uint32_t* offsets32 = column->GetValues<uint32_t>(1);
 
     for (int i = 0; i < num_rows; ++i) {
       uint16_t row_id = row_ids[i];
