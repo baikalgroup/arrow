@@ -67,7 +67,7 @@ class RowArrayAccessor {
   // has to be processed separately.
   //
   template <class PROCESS_VALUE_FN>
-  static void Visit(const RowTableImpl& rows, int column_id, int num_rows,
+  static Status Visit(const RowTableImpl& rows, int column_id, int num_rows,
                     const uint32_t* row_ids, PROCESS_VALUE_FN process_value_fn);
 
   // The supplied lambda will be called for each row in the given list of rows.

@@ -39,7 +39,7 @@ struct ARROW_EXPORT BinaryView {
     memset(this, 0, sizeof(BinaryView));
   }
 
-  BinaryView(const uint8_t* data, int32_t len) : size_(len) {
+  BinaryView(const uint8_t* data, uint32_t len) : size_(len) {
     DCHECK(len == 0);
     DCHECK(data || len == 0);
     if (isInline()) {
@@ -121,9 +121,9 @@ private:
 };
 
 /// Description of the data stored in a RowTable
-/// fixed_length字段在前，然后跟着一个一个的varbinary字段,varbinary实际上是个BianryView，不拥有数据
+/// fixed_length字段在前，然后跟着一个一个的varbinary字段,varbinary实际上是个BinaryView，不拥有数据
 struct ARROW_EXPORT RowTableMetadata {
-  const static uint32_t kBinaryViewSize = sizeof(arrow::compute::BinaryView);
+  const static uint32_t kBinaryViewSize; // = sizeof(arrow::compute::BinaryView);
 
   // 是否包括普通 binary
   bool include_binary;
@@ -164,7 +164,7 @@ struct ARROW_EXPORT RowTableMetadata {
   /// Offsets within a row to fields in their encoding order.
   std::vector<uint32_t> column_offsets;
 
-  inline uint32_t row_length() const {
+  inline uint64_t row_length() const {
     return fixed_length + varbinary_view_length;
   }
 

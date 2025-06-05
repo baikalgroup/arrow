@@ -22,12 +22,28 @@
 
 namespace arrow {
 namespace acero {
+// AVX2-only：8 × uint32 → uint64 = 两个 __m256i 输出
+inline void avx2_mul_u32_to_u64(
+    const __m256i& input_left,
+    const __m256i& input_right,
+    __m256i& out_low,
+    __m256i& out_high) {
+  alignas(32) uint32_t a[8], b[8];
+  alignas(32) uint64_t result[8];
 
-// 这些函数只被定义未被使用 包括arrow 13.0.0,15.0.0版本
-// 默认地址偏移为32bit 一次可以处理8个值，也就是说key数据总体大小不能超过4G (string 类型固定视为16B)
-// 一个变长字段16B 32位的偏移最多2^32/16=2^28=255,000,000 条记录
-// 对fixed-length和varbinary字段需要传入不同的PROCESS_8_VALUES_FN
-// 因为varbinary字段多一次寻址
+  _mm256_store_si256((__m256i*)a, input_left);
+  _mm256_store_si256((__m256i*)b, input_right);
+
+  for (int i = 0; i < 8; ++i) {
+    result[i] = static_cast<uint64_t>(a[i]) * b[i];
+  }
+
+  // 打包输出（注意 set_epi64x 顺序是逆序的）
+  out_low = _mm256_set_epi64x(result[3], result[2], result[1], result[0]);
+  out_high = _mm256_set_epi64x(result[7], result[6], result[5], result[4]);
+}
+
+// 这些函数只被定义未被使用 包括arrow 13.0.0, 15.0.0, 16.0.0版本，或许直接删除更好？
 template <class PROCESS_8_VALUES_FN>
 int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int num_rows,
                                  const uint32_t* row_ids,
@@ -40,7 +56,7 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
   bool is_fixed_length_column =
       rows.metadata().column_metadatas[column_id].is_fixed_length;
 
-  // There are 4 cases, each requiring different steps:
+  // There are 2 cases, each requiring different steps:
   // 1. Varying length column 
   // 2. Fixed length column 
 
@@ -50,18 +66,16 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
     __m256i row_length = _mm256_set1_epi32(rows.metadata().row_length());
 
     __m256i field_offset_within_row = 
-        _mm256_set1_epi32(
+        _mm256_set1_epi64x(
             rows.metadata().nth_varbinary_offset_within_row(varbinary_column_id));
     for (int i = 0; i < num_rows / unroll; ++i) {
         __m256i row_id =
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-        __m256i row_offset = _mm256_mullo_epi32(row_id, row_length);
-        // 此处field_length没有意义，在process_8_values_fn自行从binaryView内读取
-        __m256i field_length = _mm256_set1_epi32(0);
-    
-        process_8_values_fn(i * unroll, row_ptr_base,
-                            _mm256_add_epi32(row_offset, field_offset_within_row),
-                            field_length);
+        __m256i row_offset_lo, row_offset_hi;
+        avx2_mul_u32_to_u64(row_id, row_length, row_offset_lo, row_offset_hi);
+        row_offset_lo = _mm256_add_epi64(row_offset_lo, field_offset_within_row);
+        row_offset_hi = _mm256_add_epi64(row_offset_hi, field_offset_within_row);
+        process_8_values_fn(i * unroll, row_ptr_base, row_offset_lo, row_offset_hi);
     }
   }
 
@@ -69,8 +83,8 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
     __m256i field_offset_within_row =
         _mm256_set1_epi32(rows.metadata().encoded_field_offset(
             rows.metadata().pos_after_encoding(column_id)));
-    __m256i field_length =
-        _mm256_set1_epi32(rows.metadata().row_length());
+    __m256i row_length =
+        _mm256_set1_epi64x(rows.metadata().row_length());
 
     // Case 3: This is a fixed length column
     //
@@ -78,9 +92,11 @@ int RowArrayAccessor::Visit_avx2(const RowTableImpl& rows, int column_id, int nu
     for (int i = 0; i < num_rows / unroll; ++i) {
       __m256i row_id =
           _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_ids) + i);
-      __m256i row_offset = _mm256_mullo_epi32(row_id, field_length);
-      __m256i field_offset = _mm256_add_epi32(row_offset, field_offset_within_row);
-      process_8_values_fn(i * unroll, row_ptr_base, field_offset, field_length);
+      __m256i row_offset_lo, row_offset_hi;
+      avx2_mul_u32_to_u64(row_id, row_length, row_offset_lo, row_offset_hi);
+      row_offset_lo = _mm256_add_epi64(row_offset_lo, field_offset_within_row);
+      row_offset_hi = _mm256_add_epi64(row_offset_hi, field_offset_within_row);
+      process_8_values_fn(i * unroll, row_ptr_base, row_offset_lo, row_offset_hi);
     }
   }
 

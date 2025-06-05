@@ -70,7 +70,7 @@ int RowArrayAccessor::NumRowsToSkip(const RowTableImpl& rows, int column_id, int
     // Varying length column
     //
     int varbinary_column_id = VarbinaryColumnId(rows.metadata(), column_id);
-    const uint32_t row_width = rows.metadata().row_length();
+    const uint64_t row_width = rows.metadata().row_length();
 
     while (num_rows_left > 0 &&
            num_bytes_skipped < static_cast<uint32_t>(num_tail_bytes_to_skip)) {
@@ -101,7 +101,7 @@ int RowArrayAccessor::NumRowsToSkip(const RowTableImpl& rows, int column_id, int
 }
 
 template <class PROCESS_VALUE_FN>
-void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_rows,
+Status RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_rows,
                              const uint32_t* row_ids, PROCESS_VALUE_FN process_value_fn) {
   const RowTableMetadata& metadata = rows.metadata();
   
@@ -114,12 +114,16 @@ void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_ro
   if (!is_fixed_length_column) {
     const uint8_t* row_ptr_base = rows.data(1);
     int varbinary_column_id = VarbinaryColumnId(rows.metadata(), column_id);
-    uint32_t single_row_width = metadata.row_length();
+    uint64_t single_row_width = metadata.row_length();
 
-    for (int i = 0; i < num_rows; ++i) {
+    for (uint64_t i = 0; i < num_rows; ++i) {
       uint32_t row_id = row_ids[i];
       const uint8_t* row_ptr = row_ptr_base + row_id * single_row_width;
       const BinaryView* varbinary_view_ptr = metadata.nth_varbinary_ptr(row_ptr, varbinary_column_id);
+      if (reinterpret_cast<uint64_t>(varbinary_view_ptr->data()) > (1LL << 47)) {
+        // 访问虚拟内存地址超过128TB视为错误
+        return Status::UnknownError("impossible memory address");
+      }
       process_value_fn(i, varbinary_view_ptr->data(), varbinary_view_ptr->length());
     }
   }
@@ -133,7 +137,7 @@ void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_ro
     if (field_length == 0) {
       field_length = 1;
     }
-    uint32_t row_length = rows.metadata().row_length();
+    uint64_t row_length = rows.metadata().row_length();
 
     const uint8_t* row_ptr_base = rows.data(1) + field_offset_within_row;
     for (int i = 0; i < num_rows; ++i) {
@@ -142,6 +146,7 @@ void RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_ro
       process_value_fn(i, row_ptr, field_length);
     }
   }
+  return Status::OK();
 }
 
 template <class PROCESS_VALUE_FN>
@@ -232,44 +237,44 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
     uint32_t fixed_length = column_metadata.fixed_length;
     switch (fixed_length) {
       case 0:
-        RowArrayAccessor::Visit(rows_, column_id, num_rows_to_append, row_ids,
+        RETURN_NOT_OK(RowArrayAccessor::Visit(rows_, column_id, num_rows_to_append, row_ids,
                                 [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
                                   bit_util::SetBitTo(output->mutable_data(1),
                                                      num_rows_before + i, *ptr != 0);
-                                });
+                                }));
         break;
       case 1:
-        RowArrayAccessor::Visit(rows_, column_id, num_rows_to_append, row_ids,
+        RETURN_NOT_OK(RowArrayAccessor::Visit(rows_, column_id, num_rows_to_append, row_ids,
                                 [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
                                   output->mutable_data(1)[num_rows_before + i] = *ptr;
-                                });
+                                }));
         break;
       case 2:
-        RowArrayAccessor::Visit(
+        RETURN_NOT_OK(RowArrayAccessor::Visit(
             rows_, column_id, num_rows_to_append, row_ids,
             [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
               reinterpret_cast<uint16_t*>(output->mutable_data(1))[num_rows_before + i] =
                   *reinterpret_cast<const uint16_t*>(ptr);
-            });
+            }));
         break;
       case 4:
-        RowArrayAccessor::Visit(
+        RETURN_NOT_OK(RowArrayAccessor::Visit(
             rows_, column_id, num_rows_to_append, row_ids,
             [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
               reinterpret_cast<uint32_t*>(output->mutable_data(1))[num_rows_before + i] =
                   *reinterpret_cast<const uint32_t*>(ptr);
-            });
+            }));
         break;
       case 8:
-        RowArrayAccessor::Visit(
+        RETURN_NOT_OK(RowArrayAccessor::Visit(
             rows_, column_id, num_rows_to_append, row_ids,
             [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
               reinterpret_cast<uint64_t*>(output->mutable_data(1))[num_rows_before + i] =
                   *reinterpret_cast<const uint64_t*>(ptr);
-            });
+            }));
         break;
       default:
-        RowArrayAccessor::Visit(
+        RETURN_NOT_OK(RowArrayAccessor::Visit(
             rows_, column_id, num_rows_to_append, row_ids,
             [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
               uint64_t* dst = reinterpret_cast<uint64_t*>(
@@ -280,7 +285,7 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
                 arrow::util::SafeStore<uint64_t>(dst + word_id,
                                                  arrow::util::SafeLoad(src + word_id));
               }
-            });
+            }));
         break;
     }
   } else {
@@ -290,9 +295,9 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
         uint64_t* offsets =
           reinterpret_cast<uint64_t*>(output->mutable_data(1)) + num_rows_before;
       uint64_t sum = num_rows_before == 0 ? 0 : offsets[0];
-      RowArrayAccessor::Visit(
+      RETURN_NOT_OK(RowArrayAccessor::Visit(
           rows_, column_id, num_rows_to_append, row_ids,
-          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; });
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; }));
       for (int i = 0; i < num_rows_to_append; ++i) {
         uint64_t length = offsets[i];
         offsets[i] = sum;
@@ -300,7 +305,7 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
       }
       offsets[num_rows_to_append] = sum;
       RETURN_NOT_OK(output->ResizeVaryingLengthBuffer());
-      RowArrayAccessor::Visit(
+      RETURN_NOT_OK(RowArrayAccessor::Visit(
           rows_, column_id, num_rows_to_append, row_ids,
           [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
             uint64_t* dst = reinterpret_cast<uint64_t*>(
@@ -313,14 +318,14 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
               arrow::util::SafeStore<uint64_t>(dst + word_id,
                                               arrow::util::SafeLoad(src + word_id));
             }
-          });
+          }));
     } else {
         uint32_t* offsets =
           reinterpret_cast<uint32_t*>(output->mutable_data(1)) + num_rows_before;
       uint32_t sum = num_rows_before == 0 ? 0 : offsets[0];
-      RowArrayAccessor::Visit(
+      RETURN_NOT_OK(RowArrayAccessor::Visit(
           rows_, column_id, num_rows_to_append, row_ids,
-          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; });
+          [&](int i, const uint8_t* ptr, uint32_t num_bytes) { offsets[i] = num_bytes; }));
       for (int i = 0; i < num_rows_to_append; ++i) {
         uint32_t length = offsets[i];
         offsets[i] = sum;
@@ -328,7 +333,7 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
       }
       offsets[num_rows_to_append] = sum;
       RETURN_NOT_OK(output->ResizeVaryingLengthBuffer());
-      RowArrayAccessor::Visit(
+      RETURN_NOT_OK(RowArrayAccessor::Visit(
           rows_, column_id, num_rows_to_append, row_ids,
           [&](int i, const uint8_t* ptr, uint32_t num_bytes) {
             uint64_t* dst = reinterpret_cast<uint64_t*>(
@@ -341,7 +346,7 @@ Status RowArray::DecodeSelected(ResizableArrayData* output, int column_id,
               arrow::util::SafeStore<uint64_t>(dst + word_id,
                                               arrow::util::SafeLoad(src + word_id));
             }
-          });
+          }));
     }
   }
 
@@ -2600,7 +2605,6 @@ class SwissJoin : public HashJoinImpl {
         temp_stack)));
 
     // Release input batch
-    // NOTE 在这里释放了input
     input_batch.values.clear();
 
     return Status::OK();

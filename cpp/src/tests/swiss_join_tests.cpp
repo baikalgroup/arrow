@@ -50,6 +50,32 @@ int main(int argc, char* argv[])
 
 namespace arrow_test {
 
+void build_arrow_table_stringnull_int(std::shared_ptr<arrow::Table>* table) {
+    std::vector<std::shared_ptr<arrow::Array>> array_list;
+	std::unique_ptr<arrow::ArrayBuilder> str_builder = nullptr;
+	std::unique_ptr<arrow::ArrayBuilder> int_builder = nullptr;
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    auto str_field = arrow::field("str_col", arrow::large_binary());
+    auto int_field = arrow::field("int_col", arrow::uint64());
+    fields.push_back(str_field);
+    fields.push_back(int_field);
+    arrow::MakeBuilder(arrow::default_memory_pool(), str_field->type(), &str_builder);
+    arrow::MakeBuilder(arrow::default_memory_pool(), int_field->type(), &int_builder);
+    int row_count = 1025;
+    for (int i = 0 ; i < row_count ; i++) {
+    	dynamic_cast<arrow::LargeBinaryBuilder*>((str_builder).get())->AppendNull();
+        dynamic_cast<arrow::UInt64Builder*>((int_builder).get())->Append(100);
+    }
+
+    std::shared_ptr<arrow::Array> str_array, int_array;
+    str_builder->Finish(&str_array);
+    int_builder->Finish(&int_array);
+    array_list.emplace_back(str_array);
+    array_list.emplace_back(int_array);
+    std::shared_ptr<arrow::Schema> schema = std::make_shared<arrow::Schema>(fields);
+    *table = arrow::Table::Make(schema, array_list, row_count);
+}
+
 void build_arrow_table2(const std::string& prefix, std::shared_ptr<arrow::Schema>* schema ,std::shared_ptr<arrow::Table>* table, int64_t rows, int skip_gap) {
     // 10000万表，10列，全部都是string
     std::vector<std::shared_ptr<arrow::Array>> array_list;
@@ -92,6 +118,23 @@ int match_rows(int total, int skip_l, int skip_r) {
     int lcm = LCM(skip_l, skip_r);
 
     return total - total / skip_l - total / skip_r + total / lcm;
+}
+
+void run_test_group_by() {
+	std::shared_ptr<arrow::Table> table;
+    build_arrow_table_stringnull_int(&table);
+    arrow::acero::Declaration arr_tbl{"table_source", arrow::acero::TableSourceNodeOptions(table, 1025)};
+
+    std::vector<arrow::compute::Aggregate> aggregates;
+    aggregates.emplace_back("hash_max" , /*options*/nullptr, arrow::FieldRef("int_col"));
+    std::vector<arrow::FieldRef> group_by_fields;
+    group_by_fields.emplace_back(arrow::FieldRef("str_col"));
+    group_by_fields.emplace_back(arrow::FieldRef("int_col"));
+    arrow::acero::AggregateNodeOptions agg_options{aggregates, group_by_fields};
+    arrow::acero::Declaration agg{"aggregate", {std::move(arr_tbl)}, std::move(agg_options)};
+    auto result = arrow::acero::DeclarationToTable(std::move(agg), /*use_threads=*/true);
+    auto final_table = result.ValueOrDie();
+    ASSERT_EQ(final_table->num_rows(), 1);
 }
 
 int64_t run_test_arrow_run_acero_async2(int rows, int skip_left, int skip_right, arrow::acero::JoinType join_type) {
@@ -190,6 +233,10 @@ TEST(test_arrow_vector_execute, VariousJoin) {
     run_test_arrow_run_acero_async2(11, 3, 5, arrow::acero::JoinType::FULL_OUTER);
     run_test_arrow_run_acero_async2(11, 3, 5, arrow::acero::JoinType::RIGHT_SEMI);
     run_test_arrow_run_acero_async2(11, 3, 5, arrow::acero::JoinType::RIGHT_ANTI);
+}
+
+TEST(test_arrow_vector_execute, GroupTest) {
+	run_test_group_by();
 }
 
 }
