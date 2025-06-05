@@ -261,11 +261,11 @@ void EncoderInteger::Decode(uint32_t start_row, uint32_t num_rows,
   if (rows.metadata().is_fixed_length &&
       col_prep.metadata().fixed_length == rows.metadata().row_length()) {
     DCHECK_EQ(offset_within_row, 0);
-    uint32_t row_size = rows.metadata().row_length();
+    uint64_t row_size = rows.metadata().row_length();
     memcpy(col_prep.mutable_data(1), rows.data(1) + start_row * row_size,
            num_rows * row_size);
   } else {
-    uint32_t row_size = rows.metadata().row_length();
+    uint64_t row_size = rows.metadata().row_length();
     const uint8_t* row_base = rows.data(1) + start_row * row_size;
     row_base += offset_within_row;
     uint8_t* col_base = col_prep.mutable_data(1);
@@ -308,7 +308,7 @@ void EncoderBinary::EncodeSelectedImp(uint32_t offset_within_row, RowTableImpl* 
                                       const KeyColumnArray& col, uint32_t num_selected,
                                       const uint16_t* selection, COPY_FN copy_fn,
                                       SET_NULL_FN set_null_fn) {
-  uint32_t row_width = rows->metadata().row_length();
+  uint64_t row_width = rows->metadata().row_length();
   const uint8_t* src_base = col.data(1);
   uint8_t* dst = rows->mutable_data(1) + offset_within_row;
   for (uint32_t i = 0; i < num_selected; ++i) {
@@ -520,7 +520,7 @@ void EncoderBinaryPair::DecodeImp(uint32_t num_rows_to_skip, uint32_t start_row,
   uint8_t* dst_A = col1->mutable_data(1);
   uint8_t* dst_B = col2->mutable_data(1);
 
-  uint32_t row_width = rows.metadata().row_length();
+  uint64_t row_width = rows.metadata().row_length();
   const uint8_t* src_base;
 
   src_base = rows.data(1) + row_width * start_row + offset_within_row;
@@ -562,7 +562,7 @@ void EncoderOffsets::Decode(uint32_t start_row, uint32_t num_rows,
   // that row, up to and including Nth varbinary column.
 
   // const uint32_t* row_offsets = rows.offsets() + start_row;
-  const uint32_t row_length = rows.metadata().row_length();
+  const uint64_t row_length = rows.metadata().row_length();
   const uint8_t* row_base = rows.data(1) + start_row * row_length;
 
   // Set the base offset for each column
@@ -694,7 +694,7 @@ void EncoderVarBinary::EncodeSelected(uint32_t ivarbinary, RowTableImpl* rows,
   const uint8_t* col_base = cols.data(2);
 
   const RowTableMetadata metadata = rows->metadata();
-  uint32_t row_width = metadata.row_length();
+  uint64_t row_width = metadata.row_length();
   for (uint32_t i = 0; i < num_selected; ++i) {
     int32_t irow = selection[i];
     uint8_t* row = row_base + row_width * i;

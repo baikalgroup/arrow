@@ -92,7 +92,7 @@ class ARROW_EXPORT KeyCompare {
   static uint32_t NullUpdateColumnToRowImp_avx2(
       uint32_t id_col, uint32_t num_rows_to_compare, const uint16_t* sel_left_maybe_null,
       const uint32_t* left_to_right_map, LightContext* ctx, const KeyColumnArray& col,
-      const RowTableImpl& rows, uint8_t* match_bytevector);
+      const RowTableImpl& rows, uint8_t* match_bytevector, bool are_cols_in_encoding_order);
 
   template <bool use_selection, class COMPARE8_FN>
   static uint32_t CompareBinaryColumnToRowHelper_avx2(
@@ -124,7 +124,8 @@ class ARROW_EXPORT KeyCompare {
                                              const uint32_t* left_to_right_map,
                                              LightContext* ctx, const KeyColumnArray& col,
                                              const RowTableImpl& rows,
-                                             uint8_t* match_bytevector);
+                                             uint8_t* match_bytevector,
+                                             bool are_cols_in_encoding_order);
 
   static uint32_t CompareBinaryColumnToRow_avx2(
       bool use_selection, uint32_t offset_within_row, uint32_t num_rows_to_compare,

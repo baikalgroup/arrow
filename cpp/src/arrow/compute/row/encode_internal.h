@@ -163,7 +163,7 @@ class EncoderBinary {
     ARROW_DCHECK(col_const && col_const->metadata().is_fixed_length);
     uint32_t col_width = col_const->metadata().fixed_length;
 
-    uint32_t row_width = rows_const->metadata().row_length();
+    uint64_t row_width = rows_const->metadata().row_length();
     for (uint32_t i = 0; i < num_rows; ++i) {
       const uint8_t* src;
       uint8_t* dst;
@@ -249,7 +249,7 @@ class EncoderVarBinary {
     const uint32_t* col_offsets32 = col_const->offsets();
     const uint64_t* col_offsets64 = col_const->large_offsets();
 
-    const uint32_t row_width = rows_const->metadata().row_length();
+    const uint64_t row_width = rows_const->metadata().row_length();
     const uint8_t* row_base = rows_const->data(1) + start_row * row_width;
 
     for (uint32_t i = 0; i < num_rows; ++i) {

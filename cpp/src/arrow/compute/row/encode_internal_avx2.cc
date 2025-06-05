@@ -66,7 +66,7 @@ uint32_t EncoderBinaryPair::DecodeImp_avx2(uint32_t start_row, uint32_t num_rows
   uint8_t* col_vals_A = col1->mutable_data(1);
   uint8_t* col_vals_B = col2->mutable_data(1);
 
-  uint32_t row_width = rows.metadata().row_length();
+  uint64_t row_width = rows.metadata().row_length();
   const uint8_t* src_base;
   src_base = rows.data(1) + row_width * start_row + offset_within_row;
 

@@ -22,6 +22,8 @@
 namespace arrow {
 namespace compute {
 
+const uint32_t RowTableMetadata::kBinaryViewSize = sizeof(BinaryView);
+
 uint32_t RowTableMetadata::num_varbinary_cols() const {
   uint32_t result = 0;
   for (auto column_metadata : column_metadatas) {
@@ -92,9 +94,9 @@ void RowTableMetadata::FromColumnMetadataVector(
         bool is_left_fixedlen = cols[left].is_fixed_length;
         bool is_right_fixedlen = cols[right].is_fixed_length;
         uint32_t width_left =
-            cols[left].is_fixed_length ? cols[left].fixed_length : sizeof(uint32_t);
+            cols[left].is_fixed_length ? cols[left].fixed_length : 0;
         uint32_t width_right =
-            cols[right].is_fixed_length ? cols[right].fixed_length : sizeof(uint32_t);
+            cols[right].is_fixed_length ? cols[right].fixed_length : 0;
         if (is_left_pow2 != is_right_pow2) {
           return is_left_pow2;
         }
@@ -275,7 +277,7 @@ Status RowTableImpl::AppendSelectionFrom(const RowTableImpl& from,
   RETURN_NOT_OK(ResizeBuffers(num_rows_to_append));
 
   const uint8_t* src = from.rows_->data();
-  uint32_t length = metadata_.row_length();
+  uint64_t length = metadata_.row_length();
   uint8_t* dst = rows_->mutable_data() + num_rows_ * metadata_.row_length();
   for (uint32_t i = 0; i < num_rows_to_append; ++i) {
     uint16_t row_id = source_row_ids ? source_row_ids[i] : i;
