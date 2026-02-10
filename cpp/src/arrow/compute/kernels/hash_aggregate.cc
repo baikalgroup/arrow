@@ -239,8 +239,9 @@ struct GroupedCountAllImpl : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
+    RETURN_NOT_OK(counts_.Append(added_groups * sizeof(int64_t), 0));
     num_groups_ = new_num_groups;
-    return counts_.Append(added_groups * sizeof(int64_t), 0);
+    return Status::OK();
   }
 
   Status Merge(GroupedAggregator&& raw_other,
@@ -286,8 +287,9 @@ struct GroupedCountImpl : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
+    RETURN_NOT_OK(counts_.Append(added_groups * sizeof(int64_t), 0));
     num_groups_ = new_num_groups;
-    return counts_.Append(added_groups * sizeof(int64_t), 0);
+    return Status::OK();
   }
 
   Status Merge(GroupedAggregator&& raw_other,
@@ -461,10 +463,10 @@ struct GroupedReducingAggregator : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     RETURN_NOT_OK(reduced_.Append(added_groups, Impl::NullValue(*out_type_)));
     RETURN_NOT_OK(counts_.Append(added_groups, 0));
     RETURN_NOT_OK(no_nulls_.Append(added_groups, true));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -864,14 +866,13 @@ struct GroupedVarStdImpl : public GroupedAggregator {
     no_nulls_ = TypedBufferBuilder<bool>(pool_);
     return Status::OK();
   }
-
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     RETURN_NOT_OK(counts_.Append(added_groups, 0));
     RETURN_NOT_OK(means_.Append(added_groups, 0));
     RETURN_NOT_OK(m2s_.Append(added_groups, 0));
     RETURN_NOT_OK(no_nulls_.Append(added_groups, true));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -1394,11 +1395,11 @@ struct GroupedMinMaxImpl final : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     RETURN_NOT_OK(mins_.Append(added_groups, AntiExtrema<CType>::anti_min()));
     RETURN_NOT_OK(maxes_.Append(added_groups, AntiExtrema<CType>::anti_max()));
     RETURN_NOT_OK(has_values_.Append(added_groups, false));
     RETURN_NOT_OK(has_nulls_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -1501,11 +1502,11 @@ struct GroupedMinMaxImpl<Type,
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
     DCHECK_GE(added_groups, 0);
-    num_groups_ = new_num_groups;
     mins_.resize(new_num_groups);
     maxes_.resize(new_num_groups);
     RETURN_NOT_OK(has_values_.Append(added_groups, false));
     RETURN_NOT_OK(has_nulls_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -1808,7 +1809,6 @@ struct GroupedFirstLastImpl final : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     // Reusing AntiExtrema as uninitialized value here because it doesn't
     // matter what the value is. We never output the uninitialized
     // first/last value.
@@ -1818,6 +1818,7 @@ struct GroupedFirstLastImpl final : public GroupedAggregator {
     RETURN_NOT_OK(first_is_nulls_.Append(added_groups, false));
     RETURN_NOT_OK(last_is_nulls_.Append(added_groups, false));
     RETURN_NOT_OK(has_any_values_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -1996,13 +1997,13 @@ struct GroupedFirstLastImpl<Type,
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
     DCHECK_GE(added_groups, 0);
-    num_groups_ = new_num_groups;
     firsts_.resize(new_num_groups);
     lasts_.resize(new_num_groups);
     RETURN_NOT_OK(has_values_.Append(added_groups, false));
     RETURN_NOT_OK(has_any_values_.Append(added_groups, false));
     RETURN_NOT_OK(first_is_nulls_.Append(added_groups, false));
     RETURN_NOT_OK(last_is_nulls_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -2290,10 +2291,11 @@ struct GroupedBooleanAggregator : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     RETURN_NOT_OK(reduced_.Append(added_groups, Impl::NullValue()));
     RETURN_NOT_OK(no_nulls_.Append(added_groups, true));
-    return counts_.Append(added_groups, 0);
+    RETURN_NOT_OK(counts_.Append(added_groups, 0));
+    num_groups_ = new_num_groups;
+    return Status::OK();
   }
 
   Status Consume(const ExecSpan& batch) override {
@@ -2617,9 +2619,9 @@ struct GroupedOneImpl final : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
-    num_groups_ = new_num_groups;
     RETURN_NOT_OK(ones_.Append(added_groups, static_cast<CType>(0)));
     RETURN_NOT_OK(has_one_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -2716,9 +2718,9 @@ struct GroupedOneImpl<Type, enable_if_t<is_base_binary_type<Type>::value ||
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
     DCHECK_GE(added_groups, 0);
-    num_groups_ = new_num_groups;
     ones_.resize(new_num_groups);
     RETURN_NOT_OK(has_one_.Append(added_groups, false));
+    num_groups_ = new_num_groups;
     return Status::OK();
   }
 
@@ -3182,8 +3184,9 @@ struct GroupedNullListImpl : public GroupedAggregator {
 
   Status Resize(int64_t new_num_groups) override {
     auto added_groups = new_num_groups - num_groups_;
+    RETURN_NOT_OK(counts_.Append(added_groups, 0));
     num_groups_ = new_num_groups;
-    return counts_.Append(added_groups, 0);
+    return Status::OK();
   }
 
   Status Consume(const ExecSpan& batch) override {
