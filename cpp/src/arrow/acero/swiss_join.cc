@@ -120,10 +120,6 @@ Status RowArrayAccessor::Visit(const RowTableImpl& rows, int column_id, int num_
       uint32_t row_id = row_ids[i];
       const uint8_t* row_ptr = row_ptr_base + row_id * single_row_width;
       const BinaryView* varbinary_view_ptr = metadata.nth_varbinary_ptr(row_ptr, varbinary_column_id);
-      if (reinterpret_cast<uint64_t>(varbinary_view_ptr->data()) > (1LL << 47)) {
-        // 访问虚拟内存地址超过128TB视为错误
-        return Status::UnknownError("impossible memory address");
-      }
       process_value_fn(i, varbinary_view_ptr->data(), varbinary_view_ptr->length());
     }
   }

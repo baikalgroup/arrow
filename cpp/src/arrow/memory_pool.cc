@@ -54,7 +54,6 @@
 #endif
 
 namespace arrow {
-
 namespace memory_pool {
 
 namespace internal {
@@ -533,6 +532,45 @@ class SystemMemoryPool : public BaseMemoryPoolImpl<SystemAllocator> {
   std::string backend_name() const override { return "system"; }
 };
 
+class SystemMemoryPoolWithLimit : public BaseMemoryPoolImpl<SystemAllocator> {
+ public:
+  int64_t refuse_if_exceed_max_malloc_gb = -1;
+  int64_t refuse_big_size_mb = 4;
+  std::string backend_name() const override { return "system_with_limit"; }
+
+  Status check_need_refuse(int64_t alloc_size) {
+    if (refuse_if_exceed_max_malloc_gb <= 0
+        || alloc_size <= 0) {
+      return Status::OK();
+    }
+    int64_t all_die_limit = refuse_if_exceed_max_malloc_gb * 1024 * 1024 * 1024LL;
+    int64_t big_die_limit = all_die_limit * 0.9;
+    int64_t new_total_alloc_size = alloc_size + bytes_allocated();
+    if (new_total_alloc_size > all_die_limit) {
+      return Status::OutOfMemory("exceed if_exceed_max_malloc_size: "
+          + std::to_string(all_die_limit));
+    }
+    if (new_total_alloc_size > big_die_limit && alloc_size > refuse_big_size_mb * 1024 * 1024LL) {
+      return Status::OutOfMemory("exceed 0.9 * if_exceed_max_malloc_size: "
+          + std::to_string(big_die_limit));
+    }
+    return Status::OK();
+  }
+
+  Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
+    //ARROW_LOG(INFO) << "alloc size: " << size << " bytes_allocated: " << bytes_allocated();
+    RETURN_NOT_OK(check_need_refuse(size));
+    return BaseMemoryPoolImpl<SystemAllocator>::Allocate(size, alignment, out);
+  }
+
+  Status Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
+                    uint8_t** ptr) override {
+    //ARROW_LOG(INFO) << "alloc size: " << new_size << ", old_size: " << old_size << ", bytes_allocated: " << bytes_allocated();
+    RETURN_NOT_OK(check_need_refuse(new_size - old_size));
+    return BaseMemoryPoolImpl<SystemAllocator>::Reallocate(old_size, new_size, alignment, ptr);
+  }
+};
+
 class SystemDebugMemoryPool : public BaseMemoryPoolImpl<DebugAllocator<SystemAllocator>> {
  public:
   std::string backend_name() const override { return "system"; }
@@ -601,6 +639,10 @@ static struct GlobalState {
     }
   }
 
+  MemoryPool* system_memory_pool_with_limit() { 
+    return &system_pool_with_limit_; 
+  }
+
 #ifdef ARROW_JEMALLOC
   MemoryPool* jemalloc_memory_pool() {
     if (IsDebugEnabled()) {
@@ -626,6 +668,7 @@ static struct GlobalState {
 
   SystemMemoryPool system_pool_;
   SystemDebugMemoryPool system_debug_pool_;
+  SystemMemoryPoolWithLimit system_pool_with_limit_;
 #ifdef ARROW_JEMALLOC
   JemallocMemoryPool jemalloc_pool_;
   JemallocDebugMemoryPool jemalloc_debug_pool_;
@@ -637,6 +680,10 @@ static struct GlobalState {
 } global_state;
 
 MemoryPool* system_memory_pool() { return global_state.system_memory_pool(); }
+
+MemoryPool* system_memory_pool_with_limit() { 
+  return global_state.system_memory_pool_with_limit(); 
+}
 
 Status jemalloc_memory_pool(MemoryPool** out) {
 #ifdef ARROW_JEMALLOC
